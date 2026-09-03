@@ -5,32 +5,17 @@ from __future__ import annotations
 import fnmatch
 import json
 import re
-from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 
-def _fallback_paths(path: Path) -> Iterable[Path]:
-    """Support the two common mount prefixes used by the original dataset."""
-
-    text = str(path)
-    yield path
-    for before, after in (
-        ("/media/datasets/", "/media/unify/"),
-        ("/media/unify/", "/media/datasets/"),
-    ):
-        if before in text:
-            yield Path(text.replace(before, after, 1))
-
-
 def resolve_existing(path: str | Path, *, directory: bool = False) -> Path:
     requested = Path(path)
-    for candidate in _fallback_paths(requested):
-        if candidate.is_dir() if directory else candidate.is_file():
-            return candidate
+    if requested.is_dir() if directory else requested.is_file():
+        return requested
     kind = "directory" if directory else "file"
-    raise FileNotFoundError(f"Missing {kind} at both media fallbacks: {requested}")
+    raise FileNotFoundError(f"Missing {kind}: {requested}")
 
 
 def _safe_id(value: str) -> str:
@@ -169,8 +154,6 @@ def discover_samples(
     metadata_manifest: str | Path | None = None,
     min_episode_frames: int = 1,
     required_views: tuple[str, ...] = (),
-    require_later_window: bool = False,
-    window_stride: int = 1,
 ) -> list[SampleRecord]:
     """Discover episodes from metadata tables without recursively listing media."""
 
@@ -204,11 +187,6 @@ def discover_samples(
             for episode in _read_jsonl(episode_path)
             if int(episode.get("length", 0)) >= int(min_episode_frames)
         ]
-        if require_later_window and not any(
-            int(episode["length"]) >= int(min_episode_frames) + int(window_stride)
-            for episode in episode_rows
-        ):
-            continue
         for episode in episode_rows:
             episode_index = int(episode["episode_index"])
             if episodes is not None and episode_index not in episodes:

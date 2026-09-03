@@ -101,8 +101,6 @@ class PromptAnnotationPipeline:
             metadata_manifest=self._config.metadata_manifest,
             min_episode_frames=selection.min_episode_frames,
             required_views=tuple(selection.required_views),
-            require_later_window=selection.require_later_window,
-            window_stride=selection.window_stride,
         )
 
     def inspect(

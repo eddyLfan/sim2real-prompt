@@ -18,11 +18,8 @@ provider:
 # Paired LeRobot discovery reads one dataset-directory level and metadata only.
 # A Sim video key must end in `_sim`; its Real key is the same name without `_sim`.
 discovery:
-  # Defaults match the original 161-frame, stride-120 training recipe.
-  min_episode_frames: 161
-  required_views: [camera_head, camera_wrist_left, camera_wrist_right]
-  require_later_window: true
-  window_stride: 120
+  min_episode_frames: 1
+  required_views: []          # empty means every available paired view set
 
 media:
   mode: selected_frames       # selected_frames | native_video

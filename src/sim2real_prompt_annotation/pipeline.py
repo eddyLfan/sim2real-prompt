@@ -617,8 +617,6 @@ class BatchPipeline:
                 metadata_manifest=self.config.metadata_manifest,
                 min_episode_frames=discovery.min_episode_frames,
                 required_views=tuple(discovery.required_views),
-                require_later_window=discovery.require_later_window,
-                window_stride=discovery.window_stride,
             )
         records = list(records)
         if len({record.sample_id for record in records}) != len(records):

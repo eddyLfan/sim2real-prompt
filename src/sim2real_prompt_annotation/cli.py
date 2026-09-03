@@ -90,10 +90,7 @@ def _add_config(parser: argparse.ArgumentParser) -> None:
 def _add_selection(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--dataset-glob",
-        default=os.environ.get(
-            "SIM2REAL_PROMPT_DATASET_GLOBS",
-            os.environ.get("S2R_DATASET_GLOBS", "*"),
-        ),
+        default=os.environ.get("SIM2REAL_PROMPT_DATASET_GLOBS", "*"),
         help="Dataset directory glob or comma-separated globs",
     )
     parser.add_argument("--episodes", help="Episode ids/ranges, e.g. 0,2,5-9")

@@ -21,6 +21,23 @@ class StandalonePackageTest(unittest.TestCase):
         self.assertEqual(package.__all__, ["PromptAnnotationPipeline"])
         self.assertTrue(callable(package.PromptAnnotationPipeline))
 
+    def test_has_no_omini_s2r_compatibility_contract(self) -> None:
+        project_root = Path(__file__).resolve().parents[1]
+        source_root = project_root / "src/sim2real_prompt_annotation"
+        source = "\n".join(
+            path.read_text(encoding="utf-8")
+            for path in sorted(source_root.glob("*.py"))
+        )
+        self.assertNotIn("S2R_", source)
+        self.assertNotIn("/media/datasets/", source)
+        self.assertNotIn("/media/unify/", source)
+
+        config = package.PromptAnnotationPipeline()._config
+        self.assertEqual(config.discovery.min_episode_frames, 1)
+        self.assertEqual(config.discovery.required_views, [])
+        self.assertFalse(hasattr(config.discovery, "require_later_window"))
+        self.assertFalse(hasattr(config.discovery, "window_stride"))
+
     def test_config_paths_are_relative_to_config_file(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

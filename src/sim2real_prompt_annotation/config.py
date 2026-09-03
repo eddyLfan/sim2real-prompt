@@ -11,16 +11,10 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 
 PACKAGE_ROOT = Path(__file__).resolve().parent
 DEFAULT_DATASET_ROOT = Path(
-    os.environ.get(
-        "SIM2REAL_PROMPT_DATASET_ROOT",
-        os.environ.get("S2R_DATASET_ROOT", str(Path.cwd() / "data")),
-    )
+    os.environ.get("SIM2REAL_PROMPT_DATASET_ROOT", str(Path.cwd() / "data"))
 )
 DEFAULT_OUTPUT_ROOT = Path(
-    os.environ.get(
-        "SIM2REAL_PROMPT_OUTPUT_ROOT",
-        os.environ.get("S2R_PROMPT_OUTPUT_ROOT", str(Path.cwd() / "outputs")),
-    )
+    os.environ.get("SIM2REAL_PROMPT_OUTPUT_ROOT", str(Path.cwd() / "outputs"))
 )
 
 
@@ -65,8 +59,6 @@ class DiscoveryConfig(ConfigModel):
 
     min_episode_frames: int = Field(default=1, ge=1)
     required_views: list[str] = Field(default_factory=list)
-    require_later_window: bool = False
-    window_stride: int = Field(default=1, ge=1)
 
     @field_validator("required_views")
     @classmethod
@@ -272,12 +264,8 @@ def load_config(path: str | Path) -> PipelineConfig:
                 section_payload["system_prompt"]
             )
 
-    dataset_root = os.environ.get("SIM2REAL_PROMPT_DATASET_ROOT") or os.environ.get(
-        "S2R_DATASET_ROOT"
-    )
-    output_root = os.environ.get("SIM2REAL_PROMPT_OUTPUT_ROOT") or os.environ.get(
-        "S2R_PROMPT_OUTPUT_ROOT"
-    )
+    dataset_root = os.environ.get("SIM2REAL_PROMPT_DATASET_ROOT")
+    output_root = os.environ.get("SIM2REAL_PROMPT_OUTPUT_ROOT")
     if dataset_root:
         payload["dataset_root"] = Path(dataset_root).expanduser().resolve()
     if output_root:
