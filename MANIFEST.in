@@ -1,0 +1,8 @@
+include LICENSE
+include README.md
+include .env.example
+include config.example.yaml
+recursive-include src/sim2real_prompt_annotation/prompts *.txt
+recursive-include examples *.py
+recursive-include tests *.py
+include src/sim2real_prompt_annotation/py.typed

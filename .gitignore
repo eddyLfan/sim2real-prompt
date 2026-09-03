@@ -1,0 +1,16 @@
+.env
+.venv/
+__pycache__/
+*.egg-info/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+build/
+dist/
+data/
+outputs/
+
+# The parent OminiEWM repository ignores test* globally. Keep this project's
+# tests visible when the directory is committed.
+!tests/
+!tests/*.py
