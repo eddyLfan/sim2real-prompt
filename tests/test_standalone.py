@@ -81,18 +81,14 @@ class StandalonePackageTest(unittest.TestCase):
                         "video_path": video_template,
                         "features": {
                             "observation.images.camera_head": {"dtype": "video"},
-                            "observation.images.camera_head_sim": {
-                                "dtype": "video"
-                            },
+                            "observation.images.camera_head_sim": {"dtype": "video"},
                         },
                     }
                 ),
                 encoding="utf-8",
             )
             (dataset / "meta/episodes.jsonl").write_text(
-                json.dumps(
-                    {"episode_index": 0, "length": 8, "tasks": ["move block"]}
-                )
+                json.dumps({"episode_index": 0, "length": 8, "tasks": ["move block"]})
                 + "\n",
                 encoding="utf-8",
             )

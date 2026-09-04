@@ -60,12 +60,7 @@ def command_audit(args: argparse.Namespace) -> int:
 
 
 def command_render(args: argparse.Namespace) -> int:
-    value = _pipeline(args).render(args.annotation, variant=args.variant)
-    text = (
-        json.dumps(value, ensure_ascii=False, indent=2)
-        if isinstance(value, dict)
-        else value
-    )
+    text = _pipeline(args).render(args.annotation)
     if args.output:
         destination = Path(args.output)
         destination.parent.mkdir(parents=True, exist_ok=True)
@@ -100,7 +95,7 @@ def _add_selection(parser: argparse.ArgumentParser) -> None:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="sim2real-prompt",
-        description="Structured Qwen annotation for paired LeRobot datasets",
+        description="Project-specific compact prompts for paired LeRobot datasets",
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
 
@@ -142,11 +137,6 @@ def build_parser() -> argparse.ArgumentParser:
     )
     _add_config(render_parser)
     render_parser.add_argument("--annotation", required=True)
-    render_parser.add_argument(
-        "--variant",
-        default="all",
-        choices=["all", "full", "reference", "semantic", "minimal"],
-    )
     render_parser.add_argument("--output")
     render_parser.set_defaults(handler=command_render)
 

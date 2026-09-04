@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "sim2real-prompt-annotation"
 version = "0.1.0"
-description = "Structured Qwen prompt annotation for paired Sim/Real LeRobot datasets"
+description = "Project-specific compact prompts for paired Sim/Real LeRobot data"
 readme = "README.md"
 requires-python = ">=3.10"
 license = {file = "LICENSE"}

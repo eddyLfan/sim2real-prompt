@@ -1,4 +1,4 @@
-"""Concurrent, resumable batch pipeline."""
+"""Concurrent, resumable project-specific annotation pipeline."""
 
 from __future__ import annotations
 
@@ -18,19 +18,12 @@ from .config import DatasetPromptExportConfig, PipelineConfig
 from .lerobot import SampleRecord, discover_samples
 from .media import MediaPreparer, PreparedMedia
 from .models import StructuredAnnotation, ValidationResult
-from .qwen import (
-    QwenOpenAIClient,
-    ResponseParseError,
-    VLMClient,
-    VLMResponse,
-)
+from .qwen import QwenOpenAIClient, ResponseParseError, VLMClient, VLMResponse
 from .renderer import PromptRenderer
 from .validation import (
-    apply_automatic_safe_edits,
     canonicalize_annotation,
     find_local_issues,
     merge_validation,
-    normalize_annotation_evidence,
 )
 
 
@@ -50,7 +43,7 @@ class AnnotationService:
             raise ValueError(f"System prompt is empty: {path}")
         return value
 
-    def _api_call(self, **kwargs) -> VLMResponse:  # type: ignore[no-untyped-def]
+    def _api_call(self, **kwargs: Any) -> VLMResponse:
         retries = self.config.batch.api_retry_count
         delay = self.config.batch.backoff_initial_seconds
         for attempt in range(retries + 1):
@@ -69,12 +62,33 @@ class AnnotationService:
         raise AssertionError("unreachable")
 
     @staticmethod
-    def _prompt_metadata(record: SampleRecord) -> dict[str, Any]:
+    def _prompt_metadata(record: SampleRecord, media: PreparedMedia) -> dict[str, Any]:
         metadata = record.annotation_metadata()
-        # Media preparation consumes synchronization payloads; the VLM does not.
         metadata.pop("frame_mapping", None)
         metadata.pop("media_urls", None)
+        if media.reference is not None:
+            metadata["selected_reference"] = {
+                "view": media.reference.view,
+                "frame_index": media.reference.frame_index,
+                "evidence_id": media.reference.evidence_id,
+            }
         return metadata
+
+    @staticmethod
+    def _fix_identifiers(
+        annotation: StructuredAnnotation,
+        record: SampleRecord,
+        media: PreparedMedia,
+    ) -> StructuredAnnotation:
+        updates: dict[str, Any] = {"sample_id": record.sample_id}
+        if media.reference is not None:
+            updates["reference"] = annotation.reference.model_copy(
+                update={
+                    "view": media.reference.view,
+                    "frame_index": media.reference.frame_index,
+                }
+            )
+        return annotation.model_copy(update=updates)
 
     def annotate(
         self,
@@ -84,16 +98,19 @@ class AnnotationService:
         critic_feedback: ValidationResult | None = None,
     ) -> VLMResponse:
         metadata = json.dumps(
-            self._prompt_metadata(record), ensure_ascii=False, indent=2, sort_keys=True
+            self._prompt_metadata(record, media),
+            ensure_ascii=False,
+            indent=2,
+            sort_keys=True,
         )
         user_text = (
-            "Create the canonical structured annotation for the supplied paired "
-            "media.\n\n"
+            "Create the detailed annotation and compact prompt plan for this paired "
+            "episode.\n\n"
             f"AUTHORITATIVE METADATA JSON:\n{metadata}"
         )
         if critic_feedback is not None:
             user_text += (
-                "\n\nA previous candidate failed validation. Correct only the listed "
+                "\n\nThe previous candidate failed validation. Correct the listed "
                 "problems while re-deriving claims from the supplied evidence:\n"
                 + critic_feedback.model_dump_json(indent=2)
             )
@@ -103,8 +120,7 @@ class AnnotationService:
             if malformed_attempt:
                 retry_text += (
                     "\n\nThe previous response failed JSON/schema validation. "
-                    "Return one complete JSON object matching the supplied schema "
-                    "exactly."
+                    "Return one complete JSON object matching the schema exactly."
                 )
             try:
                 response = self._api_call(
@@ -117,13 +133,11 @@ class AnnotationService:
                     temperature=self.config.annotation.temperature,
                     max_tokens=self.config.annotation.max_tokens,
                 )
-                annotation = StructuredAnnotation.model_validate(
-                    response.payload.model_dump()
+                annotation = self._fix_identifiers(
+                    StructuredAnnotation.model_validate(response.payload.model_dump()),
+                    record,
+                    media,
                 )
-                if annotation.sample_id != record.sample_id:
-                    annotation = annotation.model_copy(
-                        update={"sample_id": record.sample_id}
-                    )
                 return VLMResponse(
                     payload=annotation,
                     raw_text=response.raw_text,
@@ -144,10 +158,13 @@ class AnnotationService:
         annotation: StructuredAnnotation,
     ) -> VLMResponse:
         metadata = json.dumps(
-            self._prompt_metadata(record), ensure_ascii=False, indent=2, sort_keys=True
+            self._prompt_metadata(record, media),
+            ensure_ascii=False,
+            indent=2,
+            sort_keys=True,
         )
         user_text = (
-            "Validate the candidate annotation against all supplied evidence.\n\n"
+            "Validate the candidate against every supplied condition.\n\n"
             f"AUTHORITATIVE METADATA JSON:\n{metadata}\n\n"
             f"CANDIDATE ANNOTATION JSON:\n{annotation.model_dump_json(indent=2)}"
         )
@@ -157,8 +174,7 @@ class AnnotationService:
             if malformed_attempt:
                 retry_text += (
                     "\n\nThe previous critic response failed JSON/schema validation. "
-                    "Return one complete validation JSON object matching the supplied "
-                    "schema exactly."
+                    "Return one complete validation JSON object matching the schema."
                 )
             try:
                 return self._api_call(
@@ -178,14 +194,17 @@ class AnnotationService:
 
 
 class DatasetPromptExporter:
-    """Atomically merge rendered prompts into each dataset metadata directory."""
+    """Merge one prompt and its exact Reference identity into dataset metadata."""
 
     def __init__(self, config: DatasetPromptExportConfig, output_root: Path):
         self.config = config
         self.output_root = output_root
 
-    def _prompt_path(self, record: SampleRecord, variant: str) -> Path:
-        return self.output_root / "prompts" / variant / f"{record.sample_id}.txt"
+    def _prompt_path(self, record: SampleRecord) -> Path:
+        return self.output_root / "prompts" / f"{record.sample_id}.txt"
+
+    def _annotation_path(self, record: SampleRecord) -> Path:
+        return self.output_root / "annotations" / f"{record.sample_id}.json"
 
     @staticmethod
     def _read_existing(path: Path) -> dict[int, dict[str, Any]]:
@@ -203,33 +222,32 @@ class DatasetPromptExporter:
                         f"{path}:{line_number}: invalid JSON: {error}"
                     ) from error
                 if not isinstance(row, dict) or "episode_index" not in row:
-                    raise ValueError(
-                        f"{path}:{line_number}: expected an episode_index field"
-                    )
+                    raise ValueError(f"{path}:{line_number}: expected episode_index")
                 episode_index = int(row["episode_index"])
                 if episode_index in result:
                     raise ValueError(
                         f"{path}:{line_number}: duplicate episode {episode_index}"
                     )
-                raw_prompts = row.get("prompts")
-                if raw_prompts is None and row.get("prompt") is not None:
-                    raw_prompts = {"reference": row["prompt"]}
-                if not isinstance(raw_prompts, dict) or not raw_prompts:
+                prompt = row.get("prompt")
+                view = row.get("reference_view")
+                frame = row.get("reference_frame_index")
+                if not isinstance(prompt, str) or not prompt.strip():
                     raise ValueError(
-                        f"{path}:{line_number}: expected a non-empty prompts mapping"
+                        f"{path}:{line_number}: expected one non-empty prompt string; "
+                        "legacy prompt variants are not supported"
                     )
-                prompts = {
-                    str(variant): str(prompt).strip()
-                    for variant, prompt in raw_prompts.items()
-                    if str(variant).strip() and str(prompt).strip()
-                }
-                if len(prompts) != len(raw_prompts):
+                if not isinstance(view, str) or not view.strip():
+                    raise ValueError(f"{path}:{line_number}: expected reference_view")
+                if not isinstance(frame, int) or frame < 0:
                     raise ValueError(
-                        f"{path}:{line_number}: prompt variants must be non-empty"
+                        f"{path}:{line_number}: expected non-negative "
+                        "reference_frame_index"
                     )
                 result[episode_index] = {
                     "episode_index": episode_index,
-                    "prompts": prompts,
+                    "prompt": prompt.strip(),
+                    "reference_view": view.strip(),
+                    "reference_frame_index": frame,
                 }
         return result
 
@@ -273,23 +291,21 @@ class DatasetPromptExporter:
             )
             updated = 0
             for record in dataset_records:
-                if not self._prompt_path(record, self.config.variants[0]).is_file():
+                prompt_path = self._prompt_path(record)
+                annotation_path = self._annotation_path(record)
+                if not prompt_path.is_file() or not annotation_path.is_file():
                     continue
-                prompts: dict[str, str] = {}
-                for variant in self.config.variants:
-                    prompt_path = self._prompt_path(record, variant)
-                    if not prompt_path.is_file():
-                        raise FileNotFoundError(
-                            f"Missing {variant} prompt for completed sample: "
-                            f"{prompt_path}"
-                        )
-                    prompt = prompt_path.read_text(encoding="utf-8").strip()
-                    if not prompt:
-                        raise ValueError(f"Final prompt is empty: {prompt_path}")
-                    prompts[variant] = prompt
+                prompt = prompt_path.read_text(encoding="utf-8").strip()
+                if not prompt:
+                    raise ValueError(f"Final prompt is empty: {prompt_path}")
+                annotation = StructuredAnnotation.model_validate_json(
+                    annotation_path.read_text(encoding="utf-8")
+                )
                 rows[record.episode_index] = {
                     "episode_index": record.episode_index,
-                    "prompts": prompts,
+                    "prompt": prompt,
+                    "reference_view": annotation.reference.view,
+                    "reference_frame_index": annotation.reference.frame_index,
                 }
                 updated += 1
             if not updated:
@@ -330,13 +346,10 @@ class BatchPipeline:
             "annotations",
             "annotations_raw",
             "critiques",
+            "prompts",
             "logs",
         ):
             (self.config.output_root / relative).mkdir(parents=True, exist_ok=True)
-        for variant in self.config.renderer.variants:
-            (self.config.output_root / "prompts" / variant).mkdir(
-                parents=True, exist_ok=True
-            )
 
     @staticmethod
     def _atomic_write(path: Path, text: str) -> None:
@@ -356,6 +369,9 @@ class BatchPipeline:
     def _annotation_path(self, sample_id: str) -> Path:
         return self.config.output_root / "annotations" / f"{sample_id}.json"
 
+    def _prompt_path(self, sample_id: str) -> Path:
+        return self.config.output_root / "prompts" / f"{sample_id}.txt"
+
     def _render_existing(self, sample_id: str) -> bool:
         path = self._annotation_path(sample_id)
         if not path.is_file():
@@ -364,57 +380,53 @@ class BatchPipeline:
             annotation = StructuredAnnotation.model_validate_json(
                 path.read_text(encoding="utf-8")
             )
+            if annotation.sample_id != sample_id:
+                return False
+            prompt = self.renderer.render(annotation)
         except (OSError, ValueError):
             return False
-        if annotation.sample_id != sample_id:
-            return False
-        for variant, prompt in self.renderer.render_all(annotation).items():
-            output = self.config.output_root / "prompts" / variant / f"{sample_id}.txt"
-            try:
-                current = output.read_text(encoding="utf-8").strip()
-            except OSError:
-                current = None
-            if current != prompt:
-                self._atomic_write(output, prompt + "\n")
+        output = self._prompt_path(sample_id)
+        try:
+            current = output.read_text(encoding="utf-8").strip()
+        except OSError:
+            current = None
+        if current != prompt:
+            self._atomic_write(output, prompt + "\n")
         return True
 
     def _audit_completion(
         self, records: Iterable[SampleRecord]
     ) -> list[dict[str, Any]]:
         exported_tables: dict[Path, dict[int, dict[str, Any]]] = {}
-        incomplete = []
+        incomplete: list[dict[str, Any]] = []
         for record in records:
-            reasons = []
-            rendered: dict[str, str] = {}
+            reasons: list[str] = []
+            rendered: str | None = None
+            annotation: StructuredAnnotation | None = None
             try:
                 annotation = StructuredAnnotation.model_validate_json(
                     self._annotation_path(record.sample_id).read_text(encoding="utf-8")
                 )
                 if annotation.sample_id != record.sample_id:
                     reasons.append("canonical sample_id mismatch")
-                rendered = self.renderer.render_all(annotation)
+                rendered = self.renderer.render(annotation)
             except (OSError, ValueError) as error:
                 reasons.append(f"invalid/missing canonical annotation: {error}")
-            output_prompts: dict[str, str] = {}
-            for variant in self.config.renderer.variants:
-                output = (
-                    self.config.output_root
-                    / "prompts"
-                    / variant
-                    / f"{record.sample_id}.txt"
+
+            prompt: str | None = None
+            try:
+                prompt = (
+                    self._prompt_path(record.sample_id)
+                    .read_text(encoding="utf-8")
+                    .strip()
                 )
-                try:
-                    prompt = output.read_text(encoding="utf-8").strip()
-                except OSError as error:
-                    reasons.append(f"missing {variant} prompt: {error}")
-                    continue
-                output_prompts[variant] = prompt
                 if not prompt:
-                    reasons.append(f"empty {variant} prompt")
-                elif rendered and prompt != rendered.get(variant):
-                    reasons.append(
-                        f"{variant} prompt differs from deterministic render"
-                    )
+                    reasons.append("empty final prompt")
+                elif rendered is not None and prompt != rendered:
+                    reasons.append("prompt differs from deterministic render")
+            except OSError as error:
+                reasons.append(f"missing final prompt: {error}")
+
             if self.config.dataset_prompt_export.enabled:
                 destination = (
                     record.dataset_root
@@ -426,28 +438,21 @@ class BatchPipeline:
                         exported_tables[destination] = (
                             self.dataset_exporter.read_existing(destination)
                         )
-                    rows = exported_tables[destination]
+                    row = exported_tables[destination].get(record.episode_index)
                 except (OSError, ValueError) as error:
                     reasons.append(f"cannot validate consolidated prompt file: {error}")
-                    rows = {}
-                row = rows.get(record.episode_index)
-                prompts = row.get("prompts", {}) if row else {}
-                missing_variants = [
-                    variant
-                    for variant in self.config.dataset_prompt_export.variants
-                    if not str(prompts.get(variant, "")).strip()
-                ]
-                if missing_variants:
-                    reasons.append(
-                        f"consolidated prompt misses variants {missing_variants}"
-                    )
-                elif any(
-                    prompts.get(variant) != output_prompts.get(variant)
-                    for variant in self.config.dataset_prompt_export.variants
+                    row = None
+                if row is None:
+                    reasons.append("consolidated prompt row is missing")
+                elif annotation is not None and (
+                    row["prompt"] != prompt
+                    or row["reference_view"] != annotation.reference.view
+                    or row["reference_frame_index"] != annotation.reference.frame_index
                 ):
                     reasons.append(
-                        "consolidated prompt differs from rendered prompt files"
+                        "consolidated prompt/reference differs from canonical output"
                     )
+
             if reasons:
                 incomplete.append(
                     {
@@ -488,9 +493,7 @@ class BatchPipeline:
         )
 
     def _process(self, record: SampleRecord) -> str:
-        if self.config.batch.skip_completed and self._render_existing(
-            record.sample_id
-        ):
+        if self.config.batch.skip_completed and self._render_existing(record.sample_id):
             return "skipped"
 
         media = self.media_preparer.prepare(record)
@@ -505,15 +508,14 @@ class BatchPipeline:
             self._log_usage(
                 record.sample_id, f"annotation_attempt_{attempt}", annotation_response
             )
-            annotation = normalize_annotation_evidence(
-                StructuredAnnotation.model_validate(
-                    annotation_response.payload.model_dump()
-                )
+            annotation = StructuredAnnotation.model_validate(
+                annotation_response.payload.model_dump()
             )
             local = find_local_issues(
                 annotation,
                 record.annotation_metadata(),
                 confidence_threshold=self.config.annotation.confidence_threshold,
+                renderer=self.renderer,
             )
             if self.config.critic.enabled:
                 critique_response = self.service.critique(record, media, annotation)
@@ -528,41 +530,6 @@ class BatchPipeline:
                 )
             else:
                 validation = local
-            safe_edits = [
-                edit for edit in validation.recommended_edits if edit.automatic_safe
-            ]
-            if (
-                validation.has_severe_errors()
-                and self.config.critic.apply_safe_edits
-                and safe_edits
-            ):
-                corrected = apply_automatic_safe_edits(annotation, validation)
-                if corrected != annotation:
-                    corrected_local = find_local_issues(
-                        corrected,
-                        record.annotation_metadata(),
-                        confidence_threshold=(
-                            self.config.annotation.confidence_threshold
-                        ),
-                    )
-                    if self.config.critic.enabled:
-                        corrected_response = self.service.critique(
-                            record, media, corrected
-                        )
-                        self._log_usage(
-                            record.sample_id,
-                            f"critique_after_safe_edits_{attempt}",
-                            corrected_response,
-                        )
-                        validation = merge_validation(
-                            ValidationResult.model_validate(
-                                corrected_response.payload.model_dump()
-                            ),
-                            corrected_local,
-                        )
-                    else:
-                        validation = corrected_local
-                    annotation = corrected
             if (
                 not validation.has_severe_errors()
                 or attempt >= self.config.annotation.severe_retry_count
@@ -587,22 +554,11 @@ class BatchPipeline:
             raise ValueError(
                 f"Validation still has severe errors after retries: {record.sample_id}"
             )
-        canonical = canonicalize_annotation(
-            annotation,
-            validation,
-            self.config.annotation,
-            record.annotation_metadata(),
-            apply_safe_edits=self.config.critic.apply_safe_edits,
-        )
-        # Write the canonical annotation last so it serves as the completion marker.
-        for variant, prompt in self.renderer.render_all(canonical).items():
-            self._atomic_write(
-                self.config.output_root
-                / "prompts"
-                / variant
-                / f"{record.sample_id}.txt",
-                prompt + "\n",
-            )
+
+        canonical = canonicalize_annotation(annotation)
+        prompt = self.renderer.render(canonical)
+        self._atomic_write(self._prompt_path(record.sample_id), prompt + "\n")
+        # Canonical annotation is the completion marker and is written last.
         self._atomic_write(
             self._annotation_path(record.sample_id),
             canonical.model_dump_json(indent=2) + "\n",
@@ -621,13 +577,14 @@ class BatchPipeline:
         records = list(records)
         if len({record.sample_id for record in records}) != len(records):
             raise ValueError("Batch selection contains duplicate sample ids")
+
         counts = {"succeeded": 0, "skipped": 0}
         completed_records: list[SampleRecord] = []
         pending = list(records)
         final_errors: dict[str, str] = {}
         retry_rounds = self.config.batch.failed_retry_rounds
         for retry_round in range(retry_rounds + 1):
-            round_failures = []
+            round_failures: list[SampleRecord] = []
             with ThreadPoolExecutor(
                 max_workers=self.config.batch.concurrency
             ) as executor:
@@ -683,16 +640,17 @@ class BatchPipeline:
                 )
                 if delay:
                     time.sleep(delay)
+
         exported_datasets, exported_prompts = self.dataset_exporter.export(
             completed_records
         )
         if self.config.dataset_prompt_export.enabled:
             print(
-                f"exported {exported_prompts} episode prompt rows with variants="
-                f"{self.config.dataset_prompt_export.variants} to {exported_datasets} "
-                "dataset metadata files",
+                f"exported {exported_prompts} prompt rows to "
+                f"{exported_datasets} dataset metadata files",
                 flush=True,
             )
+
         incomplete = self._audit_completion(records)
         incomplete_ids = [item["sample_id"] for item in incomplete]
         report = {
@@ -720,8 +678,7 @@ class BatchPipeline:
         if self.config.batch.require_complete and incomplete:
             print(
                 f"completion check failed: {len(incomplete)}/{len(records)} "
-                "selected samples are incomplete; see "
-                "logs/incomplete_samples.jsonl",
+                "selected samples are incomplete; see logs/incomplete_samples.jsonl",
                 flush=True,
             )
         return BatchResult(

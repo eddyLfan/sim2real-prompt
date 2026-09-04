@@ -1,4 +1,4 @@
-"""Centralized, validated configuration for the prompt pipeline."""
+"""Centralized configuration for the project-specific annotation pipeline."""
 
 from __future__ import annotations
 
@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Literal
 
 import yaml
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 PACKAGE_ROOT = Path(__file__).resolve().parent
 DEFAULT_DATASET_ROOT = Path(
@@ -50,13 +50,12 @@ class MediaConfig(ConfigModel):
     jpeg_quality: int = Field(default=85, ge=30, le=100)
     views: list[str] = Field(default_factory=list)
     reference_view: str = "camera_head"
+    reference_seed: int = 42
     native_video_fps: float = Field(default=2.0, ge=0.1, le=10.0)
     max_native_video_mb: int = Field(default=100, ge=1)
 
 
 class DiscoveryConfig(ConfigModel):
-    """Selection contract for paired LeRobot episodes."""
-
     min_episode_frames: int = Field(default=1, ge=1)
     required_views: list[str] = Field(default_factory=list)
 
@@ -72,100 +71,22 @@ class AnnotationConfig(ConfigModel):
     retry_count: int = Field(default=2, ge=0, le=10)
     severe_retry_count: int = Field(default=1, ge=0, le=5)
     confidence_threshold: float = Field(default=0.55, ge=0.0, le=1.0)
-    drop_low_confidence_fields: bool = True
     system_prompt: Path = PACKAGE_ROOT / "prompts/annotation_system.txt"
 
 
 class CriticConfig(ConfigModel):
     enabled: bool = True
     temperature: float = Field(default=0.0, ge=0.0, le=2.0)
-    max_tokens: int = Field(default=2200, ge=256)
+    max_tokens: int = Field(default=1800, ge=256)
     retry_count: int = Field(default=2, ge=0, le=10)
-    apply_safe_edits: bool = True
     fail_on_severe_after_retries: bool = True
     system_prompt: Path = PACKAGE_ROOT / "prompts/critic_system.txt"
 
 
-class VariantConfig(ConfigModel):
-    fields: list[str]
-    appearance_mode: Literal["detailed", "reference", "none"] = "detailed"
-    omit_visible_in_reference: bool = False
-    environment_reference_override: bool = False
-
-    @field_validator("fields")
-    @classmethod
-    def validate_fields(cls, fields: list[str]) -> list[str]:
-        allowed = {
-            "robot",
-            "camera",
-            "task",
-            "actions",
-            "scene",
-            "objects",
-            "environment",
-            "appearance",
-            "lighting",
-            "imaging",
-            "preserve",
-        }
-        unknown = set(fields) - allowed
-        if unknown:
-            raise ValueError(f"Unknown renderer fields: {sorted(unknown)}")
-        return list(dict.fromkeys(fields))
-
-
-def _default_variants() -> dict[str, VariantConfig]:
-    return {
-        "full": VariantConfig(
-            fields=[
-                "robot",
-                "camera",
-                "task",
-                "actions",
-                "scene",
-                "objects",
-                "environment",
-                "appearance",
-                "lighting",
-                "imaging",
-                "preserve",
-            ]
-        ),
-        "reference": VariantConfig(
-            fields=["robot", "task", "objects", "environment", "appearance"],
-            appearance_mode="reference",
-            omit_visible_in_reference=True,
-        ),
-        "semantic": VariantConfig(
-            fields=["robot", "task", "scene", "objects", "environment"],
-            appearance_mode="none",
-        ),
-        "minimal": VariantConfig(
-            fields=["robot", "task", "environment"],
-            appearance_mode="none",
-            environment_reference_override=True,
-        ),
-    }
-
-
 class RendererConfig(ConfigModel):
-    variants: dict[str, VariantConfig] = Field(default_factory=_default_variants)
-    max_prompt_length: int = Field(default=6000, ge=512)
-    deduplicate_across_fields: bool = True
-    reference_appearance_text: str = (
-        "Match the visual appearance of the robot, objects, tabletop, and background "
-        "environment to the reference image."
-    )
-    minimal_environment_text: str = (
-        "Match the real-world environment shown in the reference image."
-    )
-
-    @model_validator(mode="after")
-    def require_standard_variants(self) -> RendererConfig:
-        missing = {"full", "reference", "semantic", "minimal"} - set(self.variants)
-        if missing:
-            raise ValueError(f"Missing required prompt variants: {sorted(missing)}")
-        return self
+    max_prompt_words: int = Field(default=55, ge=15, le=160)
+    max_prompt_characters: int = Field(default=480, ge=120, le=2000)
+    include_setting_label: bool = True
 
 
 class BatchConfig(ConfigModel):
@@ -184,19 +105,8 @@ class BatchConfig(ConfigModel):
 
 class DatasetPromptExportConfig(ConfigModel):
     enabled: bool = True
-    variants: list[str] = Field(
-        default_factory=lambda: ["full", "reference", "semantic", "minimal"]
-    )
     filename: str = "episodes_prompt.jsonl"
     merge_existing: bool = True
-
-    @field_validator("variants")
-    @classmethod
-    def validate_variants(cls, values: list[str]) -> list[str]:
-        values = list(dict.fromkeys(value.strip() for value in values if value.strip()))
-        if not values:
-            raise ValueError("dataset prompt export needs at least one variant")
-        return values
 
     @field_validator("filename")
     @classmethod
@@ -205,14 +115,6 @@ class DatasetPromptExportConfig(ConfigModel):
         if path.name != value or path.suffix != ".jsonl":
             raise ValueError("dataset prompt filename must be a plain .jsonl filename")
         return value
-
-
-class AugmentationConfig(ConfigModel):
-    """Reserved transforms; all are disabled for canonical data."""
-
-    field_dropout_enabled: bool = False
-    prompt_paraphrase_enabled: bool = False
-    text_appearance_override_enabled: bool = False
 
 
 class PipelineConfig(ConfigModel):
@@ -229,17 +131,6 @@ class PipelineConfig(ConfigModel):
     dataset_prompt_export: DatasetPromptExportConfig = Field(
         default_factory=DatasetPromptExportConfig
     )
-    augmentation: AugmentationConfig = Field(default_factory=AugmentationConfig)
-
-    @model_validator(mode="after")
-    def validate_export_variant(self) -> PipelineConfig:
-        missing = set(self.dataset_prompt_export.variants) - set(self.renderer.variants)
-        if self.dataset_prompt_export.enabled and missing:
-            raise ValueError(
-                "dataset_prompt_export variants are not renderer variants: "
-                f"{sorted(missing)}"
-            )
-        return self
 
 
 def load_config(path: str | Path) -> PipelineConfig:

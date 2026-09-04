@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
@@ -33,6 +34,7 @@ class MediaGroup:
 @dataclass(frozen=True)
 class ReferenceImage:
     view: str
+    frame_index: int
     evidence_id: str
     jpeg: bytes
 
@@ -180,10 +182,18 @@ class MediaPreparer:
         view = self.config.reference_view
         if view not in record.real_videos:
             view = views[0]
-        frame = _read_raw_frames(record.real_videos[view], [0])[0]
+        path = record.real_videos[view]
+        frame_count = _probe_video(path).frame_count
+        digest = hashlib.blake2b(
+            f"{self.config.reference_seed}:{record.sample_id}".encode(),
+            digest_size=8,
+        ).digest()
+        frame_index = int.from_bytes(digest, "little") % frame_count
+        frame = _read_raw_frames(path, [frame_index])[frame_index]
         return ReferenceImage(
             view=view,
-            evidence_id=f"reference:{view}:frame_000000",
+            frame_index=frame_index,
+            evidence_id=f"reference:{view}:frame_{frame_index:06d}",
             jpeg=_resize_and_encode(frame, self.config),
         )
 

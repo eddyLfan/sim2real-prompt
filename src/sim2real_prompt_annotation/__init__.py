@@ -1,4 +1,4 @@
-"""Paired LeRobot Sim2Real prompt annotation."""
+"""Project-specific compact Prompt annotation for paired LeRobot data."""
 
 from .api import PromptAnnotationPipeline
 

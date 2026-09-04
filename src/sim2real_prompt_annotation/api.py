@@ -53,13 +53,7 @@ def _sample_summary(record: SampleRecord) -> dict[str, Any]:
 
 
 class PromptAnnotationPipeline:
-    """Inspect, annotate, audit, and render paired LeRobot episodes.
-
-    This is the package's only supported public Python interface. ``config`` may
-    be a YAML path, a validated ``PipelineConfig``, a mapping, or ``None`` for
-    validated defaults. The VLM client is created lazily, so inspect, audit,
-    schema, render, and dry-run operations never require an API key.
-    """
+    """Inspect, annotate, audit, and render paired LeRobot episodes."""
 
     def __init__(
         self,
@@ -143,11 +137,15 @@ class PromptAnnotationPipeline:
                 preparer = MediaPreparer(self._config.media)
                 for record in records:
                     media = preparer.prepare(record)
+                    reference = media.reference
                     prepared.append(
                         {
                             "sample_id": record.sample_id,
                             "media_groups": len(media.groups),
-                            "has_reference": media.reference is not None,
+                            "reference_view": reference.view if reference else None,
+                            "reference_frame_index": (
+                                reference.frame_index if reference else None
+                            ),
                         }
                     )
             return {
@@ -177,49 +175,38 @@ class PromptAnnotationPipeline:
             dataset_glob=dataset_glob, episodes=episodes, limit=limit
         )
         renderer = PromptRenderer(self._config.renderer)
-        required = tuple(self._config.dataset_prompt_export.variants)
         tables: dict[Path, dict[int, dict[str, Any]]] = {}
         incomplete = []
         for record in records:
-            reasons = []
+            reasons: list[str] = []
+            annotation: StructuredAnnotation | None = None
+            rendered: str | None = None
             annotation_path = (
-                self._config.output_root
-                / "annotations"
-                / f"{record.sample_id}.json"
+                self._config.output_root / "annotations" / f"{record.sample_id}.json"
             )
-            rendered = None
             try:
                 annotation = StructuredAnnotation.model_validate_json(
                     annotation_path.read_text(encoding="utf-8")
                 )
                 if annotation.sample_id != record.sample_id:
                     reasons.append("canonical sample_id mismatch")
-                rendered = renderer.render_all(annotation)
+                rendered = renderer.render(annotation)
             except (OSError, ValueError) as error:
                 reasons.append(f"invalid/missing canonical annotation: {error}")
-            output_prompts: dict[str, str] = {}
-            for variant in required:
-                path = (
-                    self._config.output_root
-                    / "prompts"
-                    / variant
-                    / f"{record.sample_id}.txt"
-                )
-                try:
-                    output_prompts[variant] = path.read_text(
-                        encoding="utf-8"
-                    ).strip()
-                except OSError as error:
-                    reasons.append(f"missing {variant} prompt: {error}")
-                    continue
-                if not output_prompts[variant]:
-                    reasons.append(f"empty {variant} prompt")
-                elif rendered is not None and output_prompts[variant] != rendered.get(
-                    variant
-                ):
-                    reasons.append(
-                        f"{variant} prompt differs from deterministic render"
-                    )
+
+            prompt: str | None = None
+            prompt_path = (
+                self._config.output_root / "prompts" / f"{record.sample_id}.txt"
+            )
+            try:
+                prompt = prompt_path.read_text(encoding="utf-8").strip()
+                if not prompt:
+                    reasons.append("empty final prompt")
+                elif rendered is not None and prompt != rendered:
+                    reasons.append("prompt differs from deterministic render")
+            except OSError as error:
+                reasons.append(f"missing final prompt: {error}")
+
             if self._config.dataset_prompt_export.enabled:
                 table = tables.get(record.dataset_root)
                 if table is None:
@@ -238,17 +225,17 @@ class PromptAnnotationPipeline:
                     tables[record.dataset_root] = table
                 exported = table.get(record.episode_index)
                 if exported is None:
-                    reasons.append(
-                        "training episodes_prompt.jsonl row is missing/incomplete"
-                    )
-                elif any(
-                    exported.get("prompts", {}).get(name)
-                    != output_prompts.get(name)
-                    for name in required
+                    reasons.append("training prompt row is missing")
+                elif annotation is not None and (
+                    exported["prompt"] != prompt
+                    or exported["reference_view"] != annotation.reference.view
+                    or exported["reference_frame_index"]
+                    != annotation.reference.frame_index
                 ):
                     reasons.append(
-                        "training export differs from rendered prompt files"
+                        "training export differs from prompt/reference annotation"
                     )
+
             if reasons:
                 incomplete.append(
                     {
@@ -269,9 +256,7 @@ class PromptAnnotationPipeline:
     def render(
         self,
         annotation: str | Path | Mapping[str, Any] | StructuredAnnotation,
-        *,
-        variant: str = "all",
-    ) -> str | dict[str, str]:
+    ) -> str:
         if isinstance(annotation, StructuredAnnotation):
             parsed = annotation
         elif isinstance(annotation, Mapping):
@@ -281,13 +266,9 @@ class PromptAnnotationPipeline:
             if value.lstrip().startswith("{"):
                 raw = value
             else:
-                candidate = Path(value)
-                raw = candidate.read_text(encoding="utf-8")
+                raw = Path(value).read_text(encoding="utf-8")
             parsed = StructuredAnnotation.model_validate_json(raw)
-        renderer = PromptRenderer(self._config.renderer)
-        return renderer.render_all(parsed) if variant == "all" else renderer.render(
-            parsed, variant
-        )
+        return PromptRenderer(self._config.renderer).render(parsed)
 
     @staticmethod
     def schemas() -> dict[str, dict[str, Any]]:
