@@ -17,8 +17,9 @@ Sim + Real + same-episode Reference + Metadata
 ## 条件职责
 
 - Sim 和 RobotState 控制机器人与物体运动、接触、状态变化、空间关系、相机视角、构图和时序；
-- Prompt 描述高层任务语义及可编辑的粗粒度目标外观；
-- Reference 补充随机帧中实际可见的精细机器人、物品、工作台、背景和光照细节；
+- Prompt 定义高层任务、最终目标环境/外观/光照，并明确选择 Reference 中要使用的内容；
+- Reference 是未经区域拆分的整张随机帧，可包含无关内容，仅提供 Prompt 所选择的机器人、
+  任务物体、工作台或背景视觉证据；
 - Real Video 是目标域标注证据和训练监督。
 
 外观冲突时遵循：
@@ -29,14 +30,15 @@ Prompt 显式属性 > Reference 外观 > Sim 外观
 
 结构化标注保留 Sim invariants、任务物体语义角色、几何/affordance、目标 Real
 外观、Reference 可见范围、证据与置信度。最终 Prompt 不包含轨迹、动作阶段、逐帧状态、
-相机参数或冗余质量口号。
+相机参数或冗余质量口号。Lighting 始终写入 Prompt，不作为 Reference scope。
 
 典型 Prompt：
 
 ```text
-Real-world video of a dual-arm robot placing a blue ceramic mug on a white tray. Setting: a gray workbench; a robotics laboratory; soft overhead lighting. Use the reference for fine robot, object, workspace, and background details; explicit text attributes take priority.
+Real-world video of a dual-arm robot placing a blue ceramic mug on a white tray. Use only the robot appearance, task objects, workspace, and background environment from the reference image; explicit text attributes take priority. Render the scene with a gray workbench, a robotics laboratory, and soft overhead lighting.
 ```
 
+Prompt 固定采用 2～3 句自然语言，顺序为“任务/场景 → Reference 使用范围 → 目标呈现”。
 默认最多 55 个英文词。超限会触发验证失败和重试，不会静默截断。
 
 ## 数据格式

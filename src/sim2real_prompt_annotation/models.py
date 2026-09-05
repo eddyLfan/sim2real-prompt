@@ -9,13 +9,12 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 
 Source = Literal["metadata", "sim", "real", "reference", "pair", "inference"]
 Severity = Literal["warning", "error"]
-ReferenceScope = Literal["robot", "objects", "workspace", "background", "lighting"]
+ReferenceScope = Literal["robot", "objects", "workspace", "background"]
 REFERENCE_SCOPE_ORDER: tuple[ReferenceScope, ...] = (
     "robot",
     "objects",
     "workspace",
     "background",
-    "lighting",
 )
 IssueCategory = Literal[
     "unsupported_claim",
@@ -166,7 +165,7 @@ class PromptPlan(StrictModel):
     """Small prompt-ready payload selected from the detailed annotation."""
 
     task_clause: str = Field(min_length=1, max_length=220)
-    setting_clauses: list[str] = Field(max_length=3)
+    setting_clauses: list[str] = Field(min_length=1, max_length=3)
     reference_scopes: list[ReferenceScope]
     text_overrides_reference: Literal[True]
 

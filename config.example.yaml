@@ -46,7 +46,6 @@ critic:
 renderer:
   max_prompt_words: 55
   max_prompt_characters: 480
-  include_setting_label: true
 
 batch:
   concurrency: 4

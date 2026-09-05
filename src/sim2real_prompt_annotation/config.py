@@ -86,7 +86,6 @@ class CriticConfig(ConfigModel):
 class RendererConfig(ConfigModel):
     max_prompt_words: int = Field(default=55, ge=15, le=160)
     max_prompt_characters: int = Field(default=480, ge=120, le=2000)
-    include_setting_label: bool = True
 
 
 class BatchConfig(ConfigModel):

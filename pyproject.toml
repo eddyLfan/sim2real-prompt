@@ -51,6 +51,7 @@ sim2real_prompt_annotation = [
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-q"
+pythonpath = ["src"]
 
 [tool.ruff]
 target-version = "py310"

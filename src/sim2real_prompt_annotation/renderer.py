@@ -8,11 +8,10 @@ from .config import RendererConfig
 from .models import ReferenceScope, StructuredAnnotation, clean_text
 
 SCOPE_TEXT: dict[ReferenceScope, str] = {
-    "robot": "robot",
-    "objects": "object",
+    "robot": "robot appearance",
+    "objects": "task objects",
     "workspace": "workspace",
-    "background": "background",
-    "lighting": "lighting",
+    "background": "background environment",
 }
 
 
@@ -40,19 +39,25 @@ class PromptRenderer:
 
     @staticmethod
     def _reference_instruction(scopes: list[ReferenceScope]) -> str:
+        if not scopes:
+            return (
+                "Do not copy visual details from the reference image; "
+                "follow the explicit text attributes"
+            )
         labels = _join_natural([SCOPE_TEXT[scope] for scope in scopes])
-        target = f"fine {labels} details" if labels else "fine visual details"
         return (
-            f"Use the reference for {target}; explicit text attributes take priority."
+            f"Use only the {labels} from the reference image; "
+            "explicit text attributes take priority"
         )
 
     def render(self, annotation: StructuredAnnotation) -> str:
         plan = annotation.prompt_plan
         sentences = [f"Real-world video of {plan.task_clause}."]
+        sentences.append(f"{self._reference_instruction(plan.reference_scopes)}.")
         if plan.setting_clauses:
-            prefix = "Setting: " if self.config.include_setting_label else ""
-            sentences.append(f"{prefix}{'; '.join(plan.setting_clauses)}.")
-        sentences.append(self._reference_instruction(plan.reference_scopes))
+            sentences.append(
+                f"Render the scene with {_join_natural(plan.setting_clauses)}."
+            )
         prompt = clean_text(" ".join(sentences))
         words = prompt_word_count(prompt)
         if words > self.config.max_prompt_words:

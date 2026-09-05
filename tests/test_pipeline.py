@@ -7,6 +7,7 @@ from pathlib import Path
 
 import cv2
 import numpy as np
+from pydantic import ValidationError
 
 from sim2real_prompt_annotation import PromptAnnotationPipeline
 from sim2real_prompt_annotation.media import MediaPreparer
@@ -150,7 +151,7 @@ def _annotation(
             frame_index=reference_frame_index,
             visible_content=["robot", "mug", "workbench", "laboratory background"],
             use_for=["robot", "objects", "workspace", "background"],
-            unclear_or_occluded=["lighting"],
+            unclear_or_occluded=[],
         ),
         prompt_plan=PromptPlan(
             task_clause=(
@@ -191,6 +192,16 @@ class MockClient(VLMClient):
 
 
 class PipelineTest(unittest.TestCase):
+    def test_lighting_cannot_be_selected_as_reference_scope(self) -> None:
+        with self.assertRaises(ValidationError):
+            ReferenceDescription(
+                view="camera_head",
+                frame_index=0,
+                visible_content=["robot"],
+                use_for=["lighting"],  # type: ignore[list-item]
+                unclear_or_occluded=[],
+            )
+
     def test_public_api_runs_resumes_and_audits(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -228,6 +239,8 @@ class PipelineTest(unittest.TestCase):
             self.assertGreaterEqual(row["reference_frame_index"], 0)
             self.assertLess(row["reference_frame_index"], 6)
             self.assertIn("explicit text attributes take priority", row["prompt"])
+            self.assertIn("Render the scene with", row["prompt"])
+            self.assertEqual(row["prompt"].count("."), 3)
 
             records = pipeline._records(dataset_glob="paired_demo")
             preparer = MediaPreparer(pipeline._config.media)
