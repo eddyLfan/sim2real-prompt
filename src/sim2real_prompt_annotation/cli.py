@@ -53,6 +53,18 @@ def command_run(args: argparse.Namespace) -> int:
     return 1 if result.get("failed", 0) else 0
 
 
+def command_references(args: argparse.Namespace) -> int:
+    result = _pipeline(args).export_references(
+        **_selection(args),
+        directory_name=args.directory_name,
+        overwrite=args.overwrite,
+        full_resolution=not args.resized,
+        jpeg_quality=args.jpeg_quality,
+    )
+    _print_json(result)
+    return 0
+
+
 def command_audit(args: argparse.Namespace) -> int:
     result = _pipeline(args).audit(**_selection(args), show=args.show)
     _print_json(result)
@@ -123,6 +135,23 @@ def build_parser() -> argparse.ArgumentParser:
     )
     run_parser.add_argument("--show", type=int, default=3)
     run_parser.set_defaults(handler=command_run)
+
+    reference_parser = subparsers.add_parser(
+        "references", help="Export deterministic same-episode Reference JPEGs"
+    )
+    _add_config(reference_parser)
+    _add_selection(reference_parser)
+    reference_parser.add_argument("--directory-name", default="Reference")
+    reference_parser.add_argument("--jpeg-quality", type=int, default=95)
+    reference_parser.add_argument(
+        "--overwrite", action="store_true", help="Replace conflicting images"
+    )
+    reference_parser.add_argument(
+        "--resized",
+        action="store_true",
+        help="Export the resized prompt representation instead of full resolution",
+    )
+    reference_parser.set_defaults(handler=command_references)
 
     audit_parser = subparsers.add_parser(
         "audit", help="Audit current outputs without API access"

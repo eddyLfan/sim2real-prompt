@@ -99,9 +99,21 @@ API 时使用 `--force`。
 ```bash
 sim2real-prompt run \
   --config config.yaml \
-  --dataset-glob 'paired_task_*' \
-  --dry-run --prepare-media
+    --dataset-glob 'paired_task_*' \
+    --dry-run --prepare-media
 ```
+
+将确定性选择的同 episode Reference 帧以全分辨率 JPEG 写入数据集：
+
+```bash
+sim2real-prompt references \
+  --config config.yaml \
+  --dataset-glob 'paired_task_*'
+```
+
+默认写入 `<dataset>/Reference/episode_000000.jpg`，并将视角、帧号、随机种子、
+相对路径和 SHA-256 写入 `<dataset>/meta/reference_images.jsonl`。重复运行会跳过内容
+一致的图片；只有显式传入 `--overwrite` 才会覆盖冲突文件。
 
 审计当前输出：
 

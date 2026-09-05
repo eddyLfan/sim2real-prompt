@@ -225,6 +225,27 @@ class PipelineTest(unittest.TestCase):
                 client=MockClient(),
             )
 
+            references = pipeline.export_references(dataset_glob="paired_demo")
+            self.assertEqual(references["written"], 1)
+            reference_path = dataset / "Reference/episode_000000.jpg"
+            self.assertTrue(reference_path.is_file())
+            reference_rows = [
+                json.loads(line)
+                for line in (dataset / "meta/reference_images.jsonl")
+                .read_text(encoding="utf-8")
+                .splitlines()
+                if line
+            ]
+            self.assertEqual(len(reference_rows), 1)
+            self.assertEqual(
+                reference_rows[0]["reference_path"],
+                reference_path.relative_to(dataset).as_posix(),
+            )
+
+            resumed_references = pipeline.export_references(dataset_glob="paired_demo")
+            self.assertEqual(resumed_references["written"], 0)
+            self.assertEqual(resumed_references["skipped"], 1)
+
             result = pipeline.run(dataset_glob="paired_demo")
             self.assertEqual(result["succeeded"], 1)
             self.assertEqual(result["failed"], 0)
@@ -249,6 +270,10 @@ class PipelineTest(unittest.TestCase):
             assert first is not None and second is not None
             self.assertEqual(first.frame_index, second.frame_index)
             self.assertEqual(row["reference_frame_index"], first.frame_index)
+            self.assertEqual(
+                row["reference_frame_index"],
+                reference_rows[0]["reference_frame_index"],
+            )
 
             prompt_path = output / "prompts" / f"{sample_id}.txt"
             prompt_path.write_text("stale prompt\n", encoding="utf-8")

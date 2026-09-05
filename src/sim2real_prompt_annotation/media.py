@@ -128,6 +128,13 @@ def _resize_and_encode(frame: np.ndarray, config: MediaConfig) -> bytes:
     return encoded.tobytes()
 
 
+def _encode_full_resolution(frame: np.ndarray, jpeg_quality: int) -> bytes:
+    ok, encoded = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, jpeg_quality])
+    if not ok:
+        raise RuntimeError("OpenCV failed to encode a Reference frame as JPEG")
+    return encoded.tobytes()
+
+
 def _explicit_mapping(record: SampleRecord, view: str) -> list[tuple[int, int]]:
     raw = record.metadata.get("frame_mapping")
     if isinstance(raw, dict):
@@ -178,7 +185,24 @@ class MediaPreparer:
             )
         return [view for view in self.config.views if view in available]
 
-    def _reference(self, record: SampleRecord, views: list[str]) -> ReferenceImage:
+    def reference(
+        self,
+        record: SampleRecord,
+        views: list[str] | None = None,
+        *,
+        full_resolution: bool = False,
+        jpeg_quality: int = 95,
+    ) -> ReferenceImage:
+        """Select the deterministic same-episode Reference frame.
+
+        Prompt preparation uses the configured resized representation. Dataset
+        export can request a full-resolution JPEG while retaining the same view
+        and frame identity.
+        """
+
+        views = self._views(record) if views is None else views
+        if not views:
+            raise ValueError(f"{record.sample_id}: no paired views selected")
         view = self.config.reference_view
         if view not in record.real_videos:
             view = views[0]
@@ -194,14 +218,18 @@ class MediaPreparer:
             view=view,
             frame_index=frame_index,
             evidence_id=f"reference:{view}:frame_{frame_index:06d}",
-            jpeg=_resize_and_encode(frame, self.config),
+            jpeg=(
+                _encode_full_resolution(frame, jpeg_quality)
+                if full_resolution
+                else _resize_and_encode(frame, self.config)
+            ),
         )
 
     def prepare(self, record: SampleRecord) -> PreparedMedia:
         views = self._views(record)
         if not views:
             raise ValueError(f"{record.sample_id}: no paired views selected")
-        reference = self._reference(record, views)
+        reference = self.reference(record, views)
         groups: list[MediaGroup] = []
         for view in views:
             sim_path = record.sim_videos[view]

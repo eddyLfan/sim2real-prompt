@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
+import os
 from collections import Counter
 from collections.abc import Iterable, Mapping
 from dataclasses import asdict
@@ -61,6 +64,7 @@ class PromptAnnotationPipeline:
         *,
         dataset_root: str | Path | None = None,
         output_root: str | Path | None = None,
+        prompt_merge_existing: bool | None = None,
         client: VLMClient | None = None,
     ) -> None:
         if config is None:
@@ -77,6 +81,12 @@ class PromptAnnotationPipeline:
         if output_root is not None:
             updates["output_root"] = Path(output_root).expanduser().resolve()
         self._config = parsed.model_copy(update=updates)
+        if prompt_merge_existing is not None:
+            self._config.dataset_prompt_export = (
+                self._config.dataset_prompt_export.model_copy(
+                    update={"merge_existing": prompt_merge_existing}
+                )
+            )
         self._client = client
 
     def _records(
@@ -114,6 +124,135 @@ class PromptAnnotationPipeline:
             "datasets": dict(Counter(record.dataset_name for record in records)),
             "first_samples": [_sample_summary(record) for record in records[:show]],
         }
+
+    def export_references(
+        self,
+        *,
+        dataset_glob: str = "*",
+        episodes: str | Iterable[int] | None = None,
+        limit: int | None = None,
+        directory_name: str = "Reference",
+        overwrite: bool = False,
+        full_resolution: bool = True,
+        jpeg_quality: int = 95,
+    ) -> dict[str, Any]:
+        """Export deterministic Reference JPEGs and their identity manifest."""
+
+        directory = Path(directory_name)
+        if directory.name != directory_name or directory_name in {"", ".", ".."}:
+            raise ValueError("directory_name must be one plain directory name")
+        if not 30 <= jpeg_quality <= 100:
+            raise ValueError("jpeg_quality must be between 30 and 100")
+
+        records = self._records(
+            dataset_glob=dataset_glob, episodes=episodes, limit=limit
+        )
+        if not records:
+            raise ValueError("No paired LeRobot samples matched the selection")
+        preparer = MediaPreparer(self._config.media)
+        grouped_rows: dict[Path, dict[int, dict[str, Any]]] = {}
+        written = 0
+        skipped = 0
+        first_references: list[dict[str, Any]] = []
+
+        for record in records:
+            reference = preparer.reference(
+                record,
+                full_resolution=full_resolution,
+                jpeg_quality=jpeg_quality,
+            )
+            destination = (
+                record.dataset_root
+                / directory_name
+                / f"episode_{record.episode_index:06d}.jpg"
+            )
+            digest = hashlib.sha256(reference.jpeg).hexdigest()
+            relative_path = destination.relative_to(record.dataset_root).as_posix()
+            row = {
+                "episode_index": record.episode_index,
+                "reference_view": reference.view,
+                "reference_frame_index": reference.frame_index,
+                "reference_path": relative_path,
+                "reference_seed": self._config.media.reference_seed,
+                "sha256": digest,
+            }
+
+            if destination.is_file():
+                current_digest = hashlib.sha256(destination.read_bytes()).hexdigest()
+                if current_digest == digest:
+                    skipped += 1
+                elif not overwrite:
+                    raise ValueError(
+                        f"Reference image already exists with different content: "
+                        f"{destination}; pass overwrite=True to replace it"
+                    )
+                else:
+                    self._atomic_write_bytes(destination, reference.jpeg)
+                    written += 1
+            else:
+                self._atomic_write_bytes(destination, reference.jpeg)
+                written += 1
+
+            rows = grouped_rows.get(record.dataset_root)
+            if rows is None:
+                rows = self._read_reference_manifest(
+                    record.dataset_root / "meta" / "reference_images.jsonl"
+                )
+                grouped_rows[record.dataset_root] = rows
+            rows[record.episode_index] = row
+            if len(first_references) < 3:
+                first_references.append(row)
+
+        for dataset_root, rows in grouped_rows.items():
+            self._atomic_write_jsonl(
+                dataset_root / "meta" / "reference_images.jsonl", rows
+            )
+        return {
+            "selected": len(records),
+            "written": written,
+            "skipped": skipped,
+            "directory_name": directory_name,
+            "full_resolution": full_resolution,
+            "first_references": first_references,
+        }
+
+    @staticmethod
+    def _read_reference_manifest(path: Path) -> dict[int, dict[str, Any]]:
+        if not path.is_file():
+            return {}
+        rows: dict[int, dict[str, Any]] = {}
+        with path.open(encoding="utf-8") as handle:
+            for line_number, line in enumerate(handle, 1):
+                if not line.strip():
+                    continue
+                row = json.loads(line)
+                if not isinstance(row, dict) or "episode_index" not in row:
+                    raise ValueError(f"{path}:{line_number}: expected episode_index")
+                episode_index = int(row["episode_index"])
+                if episode_index in rows:
+                    raise ValueError(
+                        f"{path}:{line_number}: duplicate episode {episode_index}"
+                    )
+                rows[episode_index] = row
+        return rows
+
+    @staticmethod
+    def _atomic_write_bytes(path: Path, payload: bytes) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = path.with_name(f".{path.name}.tmp.{os.getpid()}")
+        temporary.write_bytes(payload)
+        os.replace(temporary, path)
+
+    @staticmethod
+    def _atomic_write_jsonl(path: Path, rows: dict[int, dict[str, Any]]) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = path.with_name(f".{path.name}.tmp.{os.getpid()}")
+        text = "".join(
+            json.dumps(rows[index], ensure_ascii=False, separators=(",", ":")) + "\n"
+            for index in sorted(rows)
+        )
+        temporary.write_text(text, encoding="utf-8")
+        os.replace(temporary, path)
 
     def run(
         self,
