@@ -20,7 +20,7 @@ discovery:
 media:
   mode: selected_frames       # selected_frames | native_video
   strategy: uniform           # uniform | keyframe
-  max_frames: 6
+  max_frames: 6               # selected video sequences use at least 4 images
   resize_long_edge: 512
   jpeg_quality: 85
   views: []                   # empty means every paired view
@@ -33,29 +33,18 @@ annotation:
   temperature: 0.1
   max_tokens: 3000
   retry_count: 2
-  severe_retry_count: 1
-  confidence_threshold: 0.55
-
-critic:
-  enabled: true
-  temperature: 0.0
-  max_tokens: 1800
-  retry_count: 2
-  fail_on_severe_after_retries: true
 
 renderer:
-  max_prompt_words: 55
-  max_prompt_characters: 480
+  target_prompt_words: 55    # generation target; keep normal prompts compact
+  max_prompt_words: 64       # hard QC ceiling for necessary detail/model variance
+  max_prompt_characters: 560
 
 batch:
   concurrency: 4
   api_retry_count: 4
   backoff_initial_seconds: 1.0
   backoff_max_seconds: 30.0
-  failed_retry_rounds: 1
-  failed_retry_backoff_seconds: 2.0
   skip_completed: true
-  require_complete: true
   log_costs: true
   input_cost_per_million: null
   output_cost_per_million: null

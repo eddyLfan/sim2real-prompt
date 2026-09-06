@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Literal
 
 import yaml
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 PACKAGE_ROOT = Path(__file__).resolve().parent
 DEFAULT_DATASET_ROOT = Path(
@@ -45,7 +45,7 @@ class ProviderConfig(ConfigModel):
 class MediaConfig(ConfigModel):
     mode: Literal["selected_frames", "native_video"] = "selected_frames"
     strategy: Literal["uniform", "keyframe"] = "uniform"
-    max_frames: int = Field(default=6, ge=2, le=64)
+    max_frames: int = Field(default=6, ge=4, le=64)
     resize_long_edge: int = Field(default=512, ge=64, le=4096)
     jpeg_quality: int = Field(default=85, ge=30, le=100)
     views: list[str] = Field(default_factory=list)
@@ -69,23 +69,19 @@ class AnnotationConfig(ConfigModel):
     temperature: float = Field(default=0.1, ge=0.0, le=2.0)
     max_tokens: int = Field(default=3000, ge=256)
     retry_count: int = Field(default=2, ge=0, le=10)
-    severe_retry_count: int = Field(default=1, ge=0, le=5)
-    confidence_threshold: float = Field(default=0.55, ge=0.0, le=1.0)
     system_prompt: Path = PACKAGE_ROOT / "prompts/annotation_system.txt"
 
 
-class CriticConfig(ConfigModel):
-    enabled: bool = True
-    temperature: float = Field(default=0.0, ge=0.0, le=2.0)
-    max_tokens: int = Field(default=1800, ge=256)
-    retry_count: int = Field(default=2, ge=0, le=10)
-    fail_on_severe_after_retries: bool = True
-    system_prompt: Path = PACKAGE_ROOT / "prompts/critic_system.txt"
-
-
 class RendererConfig(ConfigModel):
-    max_prompt_words: int = Field(default=55, ge=15, le=160)
-    max_prompt_characters: int = Field(default=480, ge=120, le=2000)
+    target_prompt_words: int = Field(default=55, ge=15, le=160)
+    max_prompt_words: int = Field(default=64, ge=15, le=160)
+    max_prompt_characters: int = Field(default=560, ge=120, le=2000)
+
+    @model_validator(mode="after")
+    def target_must_fit_hard_limit(self) -> RendererConfig:
+        if self.target_prompt_words > self.max_prompt_words:
+            raise ValueError("target_prompt_words cannot exceed max_prompt_words")
+        return self
 
 
 class BatchConfig(ConfigModel):
@@ -93,10 +89,7 @@ class BatchConfig(ConfigModel):
     api_retry_count: int = Field(default=4, ge=0, le=20)
     backoff_initial_seconds: float = Field(default=1.0, ge=0.0)
     backoff_max_seconds: float = Field(default=30.0, ge=0.0)
-    failed_retry_rounds: int = Field(default=1, ge=0, le=10)
-    failed_retry_backoff_seconds: float = Field(default=2.0, ge=0.0)
     skip_completed: bool = True
-    require_complete: bool = True
     log_costs: bool = True
     input_cost_per_million: float | None = Field(default=None, ge=0.0)
     output_cost_per_million: float | None = Field(default=None, ge=0.0)
@@ -124,7 +117,6 @@ class PipelineConfig(ConfigModel):
     discovery: DiscoveryConfig = Field(default_factory=DiscoveryConfig)
     media: MediaConfig = Field(default_factory=MediaConfig)
     annotation: AnnotationConfig = Field(default_factory=AnnotationConfig)
-    critic: CriticConfig = Field(default_factory=CriticConfig)
     renderer: RendererConfig = Field(default_factory=RendererConfig)
     batch: BatchConfig = Field(default_factory=BatchConfig)
     dataset_prompt_export: DatasetPromptExportConfig = Field(
@@ -147,13 +139,11 @@ def load_config(path: str | Path) -> PipelineConfig:
     for field_name in ("dataset_root", "output_root", "metadata_manifest"):
         if field_name in payload:
             payload[field_name] = resolve_relative(payload[field_name])
-    for section in ("annotation", "critic"):
-        section_payload = payload.get(section)
-        if isinstance(section_payload, dict) and "system_prompt" in section_payload:
-            section_payload["system_prompt"] = resolve_relative(
-                section_payload["system_prompt"]
-            )
-
+    annotation_payload = payload.get("annotation")
+    if isinstance(annotation_payload, dict) and "system_prompt" in annotation_payload:
+        annotation_payload["system_prompt"] = resolve_relative(
+            annotation_payload["system_prompt"]
+        )
     dataset_root = os.environ.get("SIM2REAL_PROMPT_DATASET_ROOT")
     output_root = os.environ.get("SIM2REAL_PROMPT_OUTPUT_ROOT")
     if dataset_root:

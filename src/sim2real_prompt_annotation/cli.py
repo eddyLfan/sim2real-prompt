@@ -119,7 +119,7 @@ def build_parser() -> argparse.ArgumentParser:
     inspect_parser.add_argument("--show", type=int, default=3)
     inspect_parser.set_defaults(handler=command_inspect)
 
-    run_parser = subparsers.add_parser("run", help="Run the resumable batch pipeline")
+    run_parser = subparsers.add_parser("run", help="Run the linear batch pipeline")
     _add_config(run_parser)
     _add_selection(run_parser)
     run_parser.add_argument(
@@ -170,7 +170,7 @@ def build_parser() -> argparse.ArgumentParser:
     render_parser.set_defaults(handler=command_render)
 
     schema_parser = subparsers.add_parser(
-        "schema", help="Print annotation and critic JSON Schemas"
+        "schema", help="Print the annotation JSON Schema"
     )
     schema_parser.set_defaults(handler=command_schema)
     return parser

@@ -9,6 +9,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 
 Source = Literal["metadata", "sim", "real", "reference", "pair", "inference"]
 Severity = Literal["warning", "error"]
+ActiveArm = Literal["left", "right", "both", "unspecified"]
 ReferenceScope = Literal["robot", "objects", "workspace", "background"]
 REFERENCE_SCOPE_ORDER: tuple[ReferenceScope, ...] = (
     "robot",
@@ -92,9 +93,84 @@ class TaskObject(StrictModel):
         return _clean_unique(values)
 
 
+class MetadataGroundedText(StrictModel):
+    """English slot text grounded by one verbatim task-metadata span."""
+
+    text: str = Field(min_length=1, max_length=120)
+    metadata_span: str = Field(min_length=1, max_length=240)
+
+    @field_validator("text", "metadata_span")
+    @classmethod
+    def normalize_grounded_text(cls, value: str) -> str:
+        value = clean_text(value).strip(" .;:,!")
+        if not value:
+            raise ValueError("grounded text must be non-empty")
+        return value
+
+
+class TaskSemantics(StrictModel):
+    """Prompt-critical slots derived only from authoritative task metadata."""
+
+    metadata_task: str = Field(min_length=1)
+    robot: str = Field(min_length=1, max_length=100)
+    active_arm: ActiveArm
+    action: MetadataGroundedText
+    primary_objects: list[MetadataGroundedText] = Field(min_length=1, max_length=4)
+    goal: MetadataGroundedText | None = None
+    constraints: list[MetadataGroundedText] = Field(default_factory=list, max_length=3)
+
+    @field_validator("metadata_task", "robot")
+    @classmethod
+    def normalize_slot_text(cls, value: str) -> str:
+        value = clean_text(value).strip(" .;:,!")
+        if not value:
+            raise ValueError("slot text must be non-empty")
+        return value
+
+    @field_validator("action")
+    @classmethod
+    def action_is_one_base_phrase(
+        cls, value: MetadataGroundedText
+    ) -> MetadataGroundedText:
+        text = value.text.lower().removeprefix("to ").strip(" .;:,!")
+        if re.search(r"\b(?:and|then|followed by)\b", text):
+            raise ValueError("action must contain one metadata-derived action")
+        return value.model_copy(update={"text": text})
+
+    @field_validator("primary_objects")
+    @classmethod
+    def objects_are_atomic(
+        cls, values: list[MetadataGroundedText]
+    ) -> list[MetadataGroundedText]:
+        for value in values:
+            if re.search(r"\b(?:with|containing|holding)\b", value.text.lower()):
+                raise ValueError(
+                    "primary objects must be atomic metadata-derived noun phrases"
+                )
+        return values
+
+    @field_validator("goal")
+    @classmethod
+    def goal_is_prepositional(
+        cls, value: MetadataGroundedText | None
+    ) -> MetadataGroundedText | None:
+        if value is None:
+            return None
+        if not re.match(
+            r"^(?:into|onto|on|in|to|beside|under|over|between|inside|outside|"
+            r"at|from|toward|through|against)\b",
+            value.text.lower(),
+        ):
+            raise ValueError("goal must be one metadata-derived prepositional phrase")
+        if re.search(r"\b(?:and|then|while|followed by)\b", value.text.lower()):
+            raise ValueError("goal cannot contain another action or phase")
+        return value
+
+
 class TaskDescription(StrictModel):
     summary: EvidenceText
     robot: EvidenceText
+    semantics: TaskSemantics
     objects: list[TaskObject] = Field(min_length=1)
 
 
@@ -114,7 +190,7 @@ class TargetVisuals(StrictModel):
     robot_appearance: EvidenceText | None = None
     workspace: EvidenceText | None = None
     background: EvidenceText | None = None
-    lighting: EvidenceText | None = None
+    lighting: EvidenceText
 
     @model_validator(mode="after")
     def require_scene_context(self) -> TargetVisuals:
@@ -161,43 +237,12 @@ class ReferenceDescription(StrictModel):
         return self
 
 
-class PromptPlan(StrictModel):
-    """Small prompt-ready payload selected from the detailed annotation."""
-
-    task_clause: str = Field(min_length=1, max_length=220)
-    setting_clauses: list[str] = Field(min_length=1, max_length=3)
-    reference_scopes: list[ReferenceScope]
-    text_overrides_reference: Literal[True]
-
-    @field_validator("task_clause")
-    @classmethod
-    def normalize_task_clause(cls, value: str) -> str:
-        value = clean_text(value).rstrip(".!?;:")
-        if not value:
-            raise ValueError("task_clause must be non-empty")
-        return value
-
-    @field_validator("setting_clauses")
-    @classmethod
-    def normalize_setting_clauses(cls, values: list[str]) -> list[str]:
-        return [value.rstrip(".!?;:") for value in _clean_unique(values)]
-
-    @field_validator("reference_scopes")
-    @classmethod
-    def unique_reference_scopes(
-        cls, values: list[ReferenceScope]
-    ) -> list[ReferenceScope]:
-        selected = set(values)
-        return [scope for scope in REFERENCE_SCOPE_ORDER if scope in selected]
-
-
 class StructuredAnnotation(StrictModel):
     sample_id: str = Field(min_length=1)
     task: TaskDescription
     sim_invariants: SimInvariants
     target_visuals: TargetVisuals
     reference: ReferenceDescription
-    prompt_plan: PromptPlan
 
 
 class ValidationIssue(StrictModel):
@@ -210,9 +255,6 @@ class ValidationIssue(StrictModel):
 
 class ValidationResult(StrictModel):
     issues: list[ValidationIssue] = Field(default_factory=list)
-    retry_recommended: bool = False
 
     def has_severe_errors(self) -> bool:
-        return self.retry_recommended or any(
-            issue.severity == "error" for issue in self.issues
-        )
+        return any(issue.severity == "error" for issue in self.issues)

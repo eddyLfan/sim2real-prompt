@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import hashlib
+import json
+import threading
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Literal
+from typing import Any, Literal
 
 import cv2
 import numpy as np
@@ -43,6 +45,10 @@ class ReferenceImage:
 class PreparedMedia:
     groups: tuple[MediaGroup, ...]
     reference: ReferenceImage | None
+
+
+class ReferenceInputError(ValueError):
+    """The canonical per-episode Reference input is absent or unusable."""
 
 
 @dataclass(frozen=True)
@@ -172,6 +178,81 @@ def _aligned_real_indices(
 class MediaPreparer:
     def __init__(self, config: MediaConfig):
         self.config = config
+        self._manifest_cache: dict[Path, dict[int, dict[str, Any]]] = {}
+        self._manifest_lock = threading.Lock()
+
+    def _reference_manifest(self, dataset_root: Path) -> dict[int, dict[str, Any]]:
+        with self._manifest_lock:
+            cached = self._manifest_cache.get(dataset_root)
+            if cached is not None:
+                return cached
+            rows: dict[int, dict[str, Any]] = {}
+            path = dataset_root / "meta/reference_images.jsonl"
+            try:
+                with path.open(encoding="utf-8") as handle:
+                    for line in handle:
+                        if not line.strip():
+                            continue
+                        row = json.loads(line)
+                        if isinstance(row, dict) and isinstance(
+                            row.get("episode_index"), int
+                        ):
+                            rows[row["episode_index"]] = row
+            except (OSError, ValueError, json.JSONDecodeError):
+                rows = {}
+            self._manifest_cache[dataset_root] = rows
+            return rows
+
+    def _saved_reference(
+        self,
+        record: SampleRecord,
+        views: list[str],
+    ) -> ReferenceImage | None:
+        row = self._reference_manifest(record.dataset_root).get(record.episode_index)
+        if row is None:
+            return None
+        view = row.get("reference_view")
+        frame_index = row.get("reference_frame_index")
+        relative_path = row.get("reference_path")
+        if (
+            not isinstance(view, str)
+            or view not in views
+            or not isinstance(frame_index, int)
+            or frame_index < 0
+            or not isinstance(relative_path, str)
+        ):
+            return None
+        dataset_root = record.dataset_root.resolve()
+        candidates = [
+            dataset_root / "Reference" / f"episode_{record.episode_index:06d}.{suffix}"
+            for suffix in ("jpg", "jpeg", "png")
+        ]
+        existing = [path for path in candidates if path.is_file()]
+        if len(existing) != 1:
+            return None
+        path = existing[0].resolve()
+        try:
+            path.relative_to(dataset_root)
+            payload = path.read_bytes()
+        except (OSError, ValueError):
+            return None
+        manifest_path = (dataset_root / relative_path).resolve()
+        if manifest_path != path:
+            return None
+        expected_digest = row.get("sha256")
+        if isinstance(expected_digest, str) and (
+            hashlib.sha256(payload).hexdigest() != expected_digest
+        ):
+            return None
+        frame = cv2.imdecode(np.frombuffer(payload, dtype=np.uint8), cv2.IMREAD_COLOR)
+        if frame is None or frame.size == 0:
+            return None
+        return ReferenceImage(
+            view=view,
+            frame_index=frame_index,
+            evidence_id=f"reference:{view}:frame_{frame_index:06d}",
+            jpeg=_resize_and_encode(frame, self.config),
+        )
 
     def _views(self, record: SampleRecord) -> list[str]:
         available = list(record.paired_views)
@@ -203,6 +284,10 @@ class MediaPreparer:
         views = self._views(record) if views is None else views
         if not views:
             raise ValueError(f"{record.sample_id}: no paired views selected")
+        if not full_resolution:
+            saved = self._saved_reference(record, views)
+            if saved is not None:
+                return saved
         view = self.config.reference_view
         if view not in record.real_videos:
             view = views[0]
@@ -229,7 +314,17 @@ class MediaPreparer:
         views = self._views(record)
         if not views:
             raise ValueError(f"{record.sample_id}: no paired views selected")
-        reference = self.reference(record, views)
+        reference = self._saved_reference(record, views)
+        if reference is None:
+            expected = (
+                record.dataset_root
+                / "Reference"
+                / f"episode_{record.episode_index:06d}.jpg"
+            )
+            raise ReferenceInputError(
+                f"{record.sample_id}: missing or invalid Reference input: {expected}; "
+                "export References before prompt annotation"
+            )
         groups: list[MediaGroup] = []
         for view in views:
             sim_path = record.sim_videos[view]

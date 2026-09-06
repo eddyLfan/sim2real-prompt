@@ -119,16 +119,27 @@ class QwenOpenAIClient(VLMClient):
                         ),
                     }
                 )
-                content.append(
-                    {
-                        "type": "video",
-                        "video": [
-                            _data_url("image/jpeg", frame.jpeg)
-                            for frame in group.frames
-                        ],
-                        "fps": group.sampling_fps,
-                    }
-                )
+                if len(group.frames) >= 4:
+                    content.append(
+                        {
+                            "type": "video",
+                            "video": [
+                                _data_url("image/jpeg", frame.jpeg)
+                                for frame in group.frames
+                            ],
+                            "fps": group.sampling_fps,
+                        }
+                    )
+                else:
+                    # Qwen's video modality rejects sequences shorter than four
+                    # images. Preserve short episodes as ordered image inputs.
+                    content.extend(
+                        {
+                            "type": "image_url",
+                            "image_url": {"url": _data_url("image/jpeg", frame.jpeg)},
+                        }
+                        for frame in group.frames
+                    )
         if media.reference is not None:
             content.extend(
                 [

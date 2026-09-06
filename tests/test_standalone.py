@@ -49,8 +49,6 @@ class StandalonePackageTest(unittest.TestCase):
                         "output_root: ./outputs",
                         "annotation:",
                         "  system_prompt: ./annotation.txt",
-                        "critic:",
-                        "  system_prompt: ./critic.txt",
                     ]
                 ),
                 encoding="utf-8",
@@ -59,7 +57,6 @@ class StandalonePackageTest(unittest.TestCase):
             self.assertEqual(config.dataset_root, root / "paired_data")
             self.assertEqual(config.output_root, root / "outputs")
             self.assertEqual(config.annotation.system_prompt, root / "annotation.txt")
-            self.assertEqual(config.critic.system_prompt, root / "critic.txt")
 
     def test_facade_inspects_paired_lerobot_without_repository_imports(self) -> None:
         from sim2real_prompt_annotation import PromptAnnotationPipeline

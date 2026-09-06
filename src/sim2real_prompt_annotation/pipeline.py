@@ -1,4 +1,4 @@
-"""Concurrent, resumable project-specific annotation pipeline."""
+"""Concurrent linear pipeline for project-specific prompt annotation."""
 
 from __future__ import annotations
 
@@ -16,25 +16,28 @@ from typing import Any
 
 from .config import DatasetPromptExportConfig, PipelineConfig
 from .lerobot import SampleRecord, discover_samples
-from .media import MediaPreparer, PreparedMedia
+from .media import (
+    MediaPreparer,
+    PreparedMedia,
+    ReferenceInputError,
+)
 from .models import StructuredAnnotation, ValidationResult
 from .qwen import QwenOpenAIClient, ResponseParseError, VLMClient, VLMResponse
 from .renderer import PromptRenderer
+from .task_metadata import canonical_robot_description, task_contract
 from .validation import (
     canonicalize_annotation,
     find_local_issues,
-    merge_validation,
 )
 
 
 class AnnotationService:
-    """Run annotation and critic calls with schema-specific retries."""
+    """Run the single annotation API call with transport/schema retries."""
 
     def __init__(self, config: PipelineConfig, client: VLMClient):
         self.config = config
         self.client = client
         self.annotation_prompt = self._load_prompt(config.annotation.system_prompt)
-        self.critic_prompt = self._load_prompt(config.critic.system_prompt)
 
     @staticmethod
     def _load_prompt(path: Path) -> str:
@@ -51,7 +54,14 @@ class AnnotationService:
                 return self.client.generate(**kwargs)
             except ResponseParseError:
                 raise
-            except Exception:
+            except Exception as error:
+                status_code = getattr(error, "status_code", None)
+                if (
+                    isinstance(status_code, int)
+                    and 400 <= status_code < 500
+                    and status_code not in {408, 409, 429}
+                ):
+                    raise
                 if attempt >= retries:
                     raise
                 if delay:
@@ -74,13 +84,56 @@ class AnnotationService:
             }
         return metadata
 
+    def _annotation_constraints(self) -> str:
+        return (
+            "\n\nPROMPT-CRITICAL SLOT CONSTRAINTS:\n"
+            "- task.semantics is derived ONLY from task/robot metadata. Videos and "
+            "Reference must never add an action, manipulated object, destination, "
+            "instrument, or completion requirement to these slots.\n"
+            "- Copy metadata_task exactly. Every action/object/goal/constraint is a "
+            "{text, metadata_span} object. Use a short supporting metadata fragment "
+            "when the raw task is separable; compact concatenated text and reasonable "
+            "overlap are allowed. Use one lowercase English base verb in action.text.\n"
+            "- primary_objects contains only atomic metadata-named task objects; "
+            "goal contains the destination and constraints contain only "
+            "metadata-stated facts. Do not also list the goal destination as a "
+            "manipulated object.\n"
+            "- Visible objects absent from task metadata are incidental clutter. They "
+            "may appear in detailed task.objects but never in task.semantics.\n"
+            "- target_visuals uses short, coarse appearance phrases: workspace at "
+            "most 6 words, background at most 8, and lighting at most 6. Do not list "
+            "incidental objects or frame-specific states.\n"
+            "- Reference describes appearance visibility only. It never supplies "
+            "task semantics, dynamics, destinations, or completion requirements.\n"
+            f"- The deterministic renderer targets "
+            f"{self.config.renderer.target_prompt_words} words and enforces at most "
+            f"{self.config.renderer.max_prompt_words} words and "
+            f"{self.config.renderer.max_prompt_characters} characters in total.\n"
+            "- Return structured slots, not final Prompt sentences or renderer "
+            "wrappers."
+        )
+
     @staticmethod
     def _fix_identifiers(
         annotation: StructuredAnnotation,
         record: SampleRecord,
         media: PreparedMedia,
     ) -> StructuredAnnotation:
-        updates: dict[str, Any] = {"sample_id": record.sample_id}
+        semantics = annotation.task.semantics
+        contract = task_contract(record.task)
+        semantics = semantics.model_copy(
+            update={
+                "metadata_task": record.task or semantics.metadata_task,
+                "robot": canonical_robot_description(
+                    record.robot_type, semantics.robot
+                ),
+                "active_arm": contract.active_arm,
+            }
+        )
+        updates: dict[str, Any] = {
+            "sample_id": record.sample_id,
+            "task": annotation.task.model_copy(update={"semantics": semantics}),
+        }
         if media.reference is not None:
             updates["reference"] = annotation.reference.model_copy(
                 update={
@@ -94,8 +147,6 @@ class AnnotationService:
         self,
         record: SampleRecord,
         media: PreparedMedia,
-        *,
-        critic_feedback: ValidationResult | None = None,
     ) -> VLMResponse:
         metadata = json.dumps(
             self._prompt_metadata(record, media),
@@ -104,16 +155,10 @@ class AnnotationService:
             sort_keys=True,
         )
         user_text = (
-            "Create the detailed annotation and compact prompt plan for this paired "
-            "episode.\n\n"
-            f"AUTHORITATIVE METADATA JSON:\n{metadata}"
+            "Create one source-separated structured annotation for this paired "
+            "episode. Do not write a final Prompt.\n\n"
+            f"AUTHORITATIVE METADATA JSON:\n{metadata}" + self._annotation_constraints()
         )
-        if critic_feedback is not None:
-            user_text += (
-                "\n\nThe previous candidate failed validation. Correct the listed "
-                "problems while re-deriving claims from the supplied evidence:\n"
-                + critic_feedback.model_dump_json(indent=2)
-            )
         last_error: Exception | None = None
         for malformed_attempt in range(self.config.annotation.retry_count + 1):
             retry_text = user_text
@@ -145,47 +190,6 @@ class AnnotationService:
                     input_tokens=response.input_tokens,
                     output_tokens=response.output_tokens,
                     request_id=response.request_id,
-                )
-            except ResponseParseError as error:
-                last_error = error
-        assert last_error is not None
-        raise last_error
-
-    def critique(
-        self,
-        record: SampleRecord,
-        media: PreparedMedia,
-        annotation: StructuredAnnotation,
-    ) -> VLMResponse:
-        metadata = json.dumps(
-            self._prompt_metadata(record, media),
-            ensure_ascii=False,
-            indent=2,
-            sort_keys=True,
-        )
-        user_text = (
-            "Validate the candidate against every supplied condition.\n\n"
-            f"AUTHORITATIVE METADATA JSON:\n{metadata}\n\n"
-            f"CANDIDATE ANNOTATION JSON:\n{annotation.model_dump_json(indent=2)}"
-        )
-        last_error: Exception | None = None
-        for malformed_attempt in range(self.config.critic.retry_count + 1):
-            retry_text = user_text
-            if malformed_attempt:
-                retry_text += (
-                    "\n\nThe previous critic response failed JSON/schema validation. "
-                    "Return one complete validation JSON object matching the schema."
-                )
-            try:
-                return self._api_call(
-                    sample_id=record.sample_id,
-                    stage="critique",
-                    system_prompt=self.critic_prompt,
-                    user_text=retry_text,
-                    media=media,
-                    response_model=ValidationResult,
-                    temperature=self.config.critic.temperature,
-                    max_tokens=self.config.critic.max_tokens,
                 )
             except ResponseParseError as error:
                 last_error = error
@@ -286,9 +290,13 @@ class DatasetPromptExporter:
             grouped.items(), key=lambda item: str(item[0])
         ):
             destination = dataset_root / "meta" / self.config.filename
-            rows = (
-                self._read_existing(destination) if self.config.merge_existing else {}
-            )
+            if self.config.merge_existing:
+                try:
+                    rows = self.read_existing(destination)
+                except (OSError, ValueError, json.JSONDecodeError):
+                    rows = {}
+            else:
+                rows = {}
             updated = 0
             for record in dataset_records:
                 prompt_path = self._prompt_path(record)
@@ -316,12 +324,85 @@ class DatasetPromptExporter:
         return dataset_count, prompt_count
 
 
+def audit_completion(
+    config: PipelineConfig,
+    records: Iterable[SampleRecord],
+) -> list[dict[str, Any]]:
+    """Validate canonical outputs and their consolidated training rows once."""
+
+    renderer = PromptRenderer(config.renderer)
+    exporter = DatasetPromptExporter(config.dataset_prompt_export, config.output_root)
+    exported_tables: dict[Path, dict[int, dict[str, Any]]] = {}
+    incomplete: list[dict[str, Any]] = []
+    for record in records:
+        reasons: list[str] = []
+        annotation: StructuredAnnotation | None = None
+        rendered: str | None = None
+        annotation_path = (
+            config.output_root / "annotations" / f"{record.sample_id}.json"
+        )
+        try:
+            annotation = StructuredAnnotation.model_validate_json(
+                annotation_path.read_text(encoding="utf-8")
+            )
+            if annotation.sample_id != record.sample_id:
+                reasons.append("canonical sample_id mismatch")
+            rendered = renderer.render(annotation)
+        except (OSError, ValueError) as error:
+            reasons.append(f"invalid/missing canonical annotation: {error}")
+
+        prompt: str | None = None
+        prompt_path = config.output_root / "prompts" / f"{record.sample_id}.txt"
+        try:
+            prompt = prompt_path.read_text(encoding="utf-8").strip()
+            if not prompt:
+                reasons.append("empty final prompt")
+            elif rendered is not None and prompt != rendered:
+                reasons.append("prompt differs from deterministic render")
+        except OSError as error:
+            reasons.append(f"missing final prompt: {error}")
+
+        if config.dataset_prompt_export.enabled:
+            destination = (
+                record.dataset_root / "meta" / config.dataset_prompt_export.filename
+            )
+            try:
+                if destination not in exported_tables:
+                    exported_tables[destination] = exporter.read_existing(destination)
+                row = exported_tables[destination].get(record.episode_index)
+            except (OSError, ValueError) as error:
+                reasons.append(f"cannot validate consolidated prompt file: {error}")
+                row = None
+            if row is None:
+                reasons.append("consolidated prompt row is missing")
+            elif annotation is not None and (
+                row["prompt"] != prompt
+                or row["reference_view"] != annotation.reference.view
+                or row["reference_frame_index"] != annotation.reference.frame_index
+            ):
+                reasons.append(
+                    "consolidated prompt/reference differs from canonical output"
+                )
+
+        if reasons:
+            incomplete.append(
+                {
+                    "sample_id": record.sample_id,
+                    "dataset_root": str(record.dataset_root),
+                    "episode_index": record.episode_index,
+                    "reasons": reasons,
+                }
+            )
+    return incomplete
+
+
 @dataclass(frozen=True)
 class BatchResult:
     total: int
     succeeded: int
     failed: int
     skipped: int
+    excluded: int
     exported_datasets: int
     exported_prompts: int
     complete: bool
@@ -344,8 +425,7 @@ class BatchPipeline:
     def _prepare_directories(self) -> None:
         for relative in (
             "annotations",
-            "annotations_raw",
-            "critiques",
+            "validations",
             "prompts",
             "logs",
         ):
@@ -394,76 +474,6 @@ class BatchPipeline:
             self._atomic_write(output, prompt + "\n")
         return True
 
-    def _audit_completion(
-        self, records: Iterable[SampleRecord]
-    ) -> list[dict[str, Any]]:
-        exported_tables: dict[Path, dict[int, dict[str, Any]]] = {}
-        incomplete: list[dict[str, Any]] = []
-        for record in records:
-            reasons: list[str] = []
-            rendered: str | None = None
-            annotation: StructuredAnnotation | None = None
-            try:
-                annotation = StructuredAnnotation.model_validate_json(
-                    self._annotation_path(record.sample_id).read_text(encoding="utf-8")
-                )
-                if annotation.sample_id != record.sample_id:
-                    reasons.append("canonical sample_id mismatch")
-                rendered = self.renderer.render(annotation)
-            except (OSError, ValueError) as error:
-                reasons.append(f"invalid/missing canonical annotation: {error}")
-
-            prompt: str | None = None
-            try:
-                prompt = (
-                    self._prompt_path(record.sample_id)
-                    .read_text(encoding="utf-8")
-                    .strip()
-                )
-                if not prompt:
-                    reasons.append("empty final prompt")
-                elif rendered is not None and prompt != rendered:
-                    reasons.append("prompt differs from deterministic render")
-            except OSError as error:
-                reasons.append(f"missing final prompt: {error}")
-
-            if self.config.dataset_prompt_export.enabled:
-                destination = (
-                    record.dataset_root
-                    / "meta"
-                    / self.config.dataset_prompt_export.filename
-                )
-                try:
-                    if destination not in exported_tables:
-                        exported_tables[destination] = (
-                            self.dataset_exporter.read_existing(destination)
-                        )
-                    row = exported_tables[destination].get(record.episode_index)
-                except (OSError, ValueError) as error:
-                    reasons.append(f"cannot validate consolidated prompt file: {error}")
-                    row = None
-                if row is None:
-                    reasons.append("consolidated prompt row is missing")
-                elif annotation is not None and (
-                    row["prompt"] != prompt
-                    or row["reference_view"] != annotation.reference.view
-                    or row["reference_frame_index"] != annotation.reference.frame_index
-                ):
-                    reasons.append(
-                        "consolidated prompt/reference differs from canonical output"
-                    )
-
-            if reasons:
-                incomplete.append(
-                    {
-                        "sample_id": record.sample_id,
-                        "dataset_root": str(record.dataset_root),
-                        "episode_index": record.episode_index,
-                        "reasons": reasons,
-                    }
-                )
-        return incomplete
-
     def _log_usage(self, sample_id: str, stage: str, response: VLMResponse) -> None:
         if not self.config.batch.log_costs:
             return
@@ -492,71 +502,74 @@ class BatchPipeline:
             },
         )
 
+    def _quality_check(
+        self,
+        record: SampleRecord,
+        annotation: StructuredAnnotation,
+        rendered_prompt: str,
+    ) -> ValidationResult:
+        """Run deterministic local checks; no second model call is involved."""
+
+        return find_local_issues(
+            annotation,
+            record.annotation_metadata(),
+            rendered_prompt,
+            renderer=self.renderer,
+        )
+
+    def _exclude(
+        self,
+        record: SampleRecord,
+        reason: str,
+        validation: ValidationResult | None = None,
+    ) -> str:
+        row: dict[str, Any] = {
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "sample_id": record.sample_id,
+            "dataset_root": str(record.dataset_root),
+            "episode_index": record.episode_index,
+            "reason": reason,
+        }
+        if validation is not None:
+            row["validation"] = validation.model_dump()
+        self._append_jsonl(
+            self.config.output_root / "logs/excluded_samples.jsonl",
+            row,
+        )
+        return "excluded"
+
     def _process(self, record: SampleRecord) -> str:
         if self.config.batch.skip_completed and self._render_existing(record.sample_id):
             return "skipped"
 
-        media = self.media_preparer.prepare(record)
-        feedback: ValidationResult | None = None
-        annotation_response: VLMResponse | None = None
-        annotation: StructuredAnnotation | None = None
-        validation = ValidationResult()
-        for attempt in range(self.config.annotation.severe_retry_count + 1):
-            annotation_response = self.service.annotate(
-                record, media, critic_feedback=feedback
-            )
-            self._log_usage(
-                record.sample_id, f"annotation_attempt_{attempt}", annotation_response
-            )
-            annotation = StructuredAnnotation.model_validate(
-                annotation_response.payload.model_dump()
-            )
-            local = find_local_issues(
-                annotation,
-                record.annotation_metadata(),
-                confidence_threshold=self.config.annotation.confidence_threshold,
-                renderer=self.renderer,
-            )
-            if self.config.critic.enabled:
-                critique_response = self.service.critique(record, media, annotation)
-                self._log_usage(
-                    record.sample_id, f"critique_attempt_{attempt}", critique_response
-                )
-                validation = merge_validation(
-                    ValidationResult.model_validate(
-                        critique_response.payload.model_dump()
-                    ),
-                    local,
-                )
-            else:
-                validation = local
-            if (
-                not validation.has_severe_errors()
-                or attempt >= self.config.annotation.severe_retry_count
-            ):
-                break
-            feedback = validation
+        if not record.task:
+            return self._exclude(record, "missing authoritative task metadata")
+        if not record.robot_type:
+            return self._exclude(record, "missing authoritative robot_type metadata")
 
-        assert annotation_response is not None and annotation is not None
-        self._atomic_write(
-            self.config.output_root / "annotations_raw" / f"{record.sample_id}.json",
-            annotation.model_dump_json(indent=2) + "\n",
-        )
-        if self.config.critic.enabled:
-            self._atomic_write(
-                self.config.output_root / "critiques" / f"{record.sample_id}.json",
-                validation.model_dump_json(indent=2) + "\n",
-            )
-        if (
-            validation.has_severe_errors()
-            and self.config.critic.fail_on_severe_after_retries
-        ):
-            raise ValueError(
-                f"Validation still has severe errors after retries: {record.sample_id}"
-            )
+        try:
+            media = self.media_preparer.prepare(record)
+        except ReferenceInputError as error:
+            return self._exclude(record, str(error))
 
+        response = self.service.annotate(record, media)
+        self._log_usage(record.sample_id, "annotation", response)
+        annotation = StructuredAnnotation.model_validate(response.payload.model_dump())
         canonical = canonicalize_annotation(annotation)
         prompt = self.renderer.render(canonical)
+        validation = self._quality_check(record, canonical, prompt)
+        self._atomic_write(
+            self.config.output_root / "validations" / f"{record.sample_id}.json",
+            validation.model_dump_json(indent=2) + "\n",
+        )
+        if validation.has_severe_errors():
+            severe_count = sum(issue.severity == "error" for issue in validation.issues)
+            return self._exclude(
+                record,
+                f"quality check rejected candidate with {severe_count} error(s)",
+                validation,
+            )
+
         self._atomic_write(self._prompt_path(record.sample_id), prompt + "\n")
         # Canonical annotation is the completion marker and is written last.
         self._atomic_write(
@@ -578,68 +591,45 @@ class BatchPipeline:
         if len({record.sample_id for record in records}) != len(records):
             raise ValueError("Batch selection contains duplicate sample ids")
 
-        counts = {"succeeded": 0, "skipped": 0}
+        counts = {"succeeded": 0, "skipped": 0, "excluded": 0}
         completed_records: list[SampleRecord] = []
-        pending = list(records)
+        excluded_ids: set[str] = set()
         final_errors: dict[str, str] = {}
-        retry_rounds = self.config.batch.failed_retry_rounds
-        for retry_round in range(retry_rounds + 1):
-            round_failures: list[SampleRecord] = []
-            with ThreadPoolExecutor(
-                max_workers=self.config.batch.concurrency
-            ) as executor:
-                futures = {
-                    executor.submit(self._process, record): record for record in pending
-                }
-                for completed, future in enumerate(as_completed(futures), 1):
-                    record = futures[future]
-                    try:
-                        status = future.result()
-                        counts[status] += 1
+        with ThreadPoolExecutor(max_workers=self.config.batch.concurrency) as executor:
+            futures = {
+                executor.submit(self._process, record): record for record in records
+            }
+            for completed, future in enumerate(as_completed(futures), 1):
+                record = futures[future]
+                try:
+                    status = future.result()
+                    counts[status] += 1
+                    if status == "excluded":
+                        excluded_ids.add(record.sample_id)
+                    else:
                         completed_records.append(record)
-                        final_errors.pop(record.sample_id, None)
-                        print(
-                            f"[round {retry_round + 1} "
-                            f"{completed}/{len(pending)}] {status}: "
-                            f"{record.sample_id}",
-                            flush=True,
-                        )
-                    except Exception as error:
-                        final_round = retry_round >= retry_rounds
-                        round_failures.append(record)
-                        final_errors[record.sample_id] = (
-                            f"{type(error).__name__}: {error}"
-                        )
-                        self._append_jsonl(
-                            self.config.output_root / "failures.jsonl",
-                            {
-                                "timestamp": datetime.now(timezone.utc).isoformat(),
-                                "sample_id": record.sample_id,
-                                "retry_round": retry_round,
-                                "final": final_round,
-                                "error_type": type(error).__name__,
-                                "error": str(error),
-                            },
-                        )
-                        print(
-                            f"[round {retry_round + 1} "
-                            f"{completed}/{len(pending)}] failed: "
-                            f"{record.sample_id}: {type(error).__name__}: {error}",
-                            flush=True,
-                        )
-            pending = round_failures
-            if not pending:
-                break
-            if retry_round < retry_rounds:
-                delay = self.config.batch.failed_retry_backoff_seconds
-                print(
-                    f"retrying {len(pending)} failed samples only "
-                    f"(round {retry_round + 2}/{retry_rounds + 1}, "
-                    f"delay={delay}s)",
-                    flush=True,
-                )
-                if delay:
-                    time.sleep(delay)
+                    print(
+                        f"[{completed}/{len(records)}] {status}: {record.sample_id}",
+                        flush=True,
+                    )
+                except Exception as error:
+                    final_errors[record.sample_id] = f"{type(error).__name__}: {error}"
+                    self._append_jsonl(
+                        self.config.output_root / "logs/failures.jsonl",
+                        {
+                            "timestamp": datetime.now(timezone.utc).isoformat(),
+                            "sample_id": record.sample_id,
+                            "dataset_root": str(record.dataset_root),
+                            "episode_index": record.episode_index,
+                            "error_type": type(error).__name__,
+                            "error": str(error),
+                        },
+                    )
+                    print(
+                        f"[{completed}/{len(records)}] failed: {record.sample_id}: "
+                        f"{type(error).__name__}: {error}",
+                        flush=True,
+                    )
 
         exported_datasets, exported_prompts = self.dataset_exporter.export(
             completed_records
@@ -651,13 +641,14 @@ class BatchPipeline:
                 flush=True,
             )
 
-        incomplete = self._audit_completion(records)
+        incomplete = audit_completion(self.config, records)
         incomplete_ids = [item["sample_id"] for item in incomplete]
         report = {
             "timestamp": datetime.now(timezone.utc).isoformat(),
             "total": len(records),
             "complete": not incomplete,
             "complete_samples": len(records) - len(incomplete),
+            "excluded_samples": sorted(excluded_ids),
             "incomplete_samples": incomplete,
             "final_errors": final_errors,
         }
@@ -672,13 +663,11 @@ class BatchPipeline:
                 for item in incomplete
             ),
         )
-        failed_ids = {record.sample_id for record in pending}
-        if self.config.batch.require_complete:
-            failed_ids.update(incomplete_ids)
-        if self.config.batch.require_complete and incomplete:
+        failed_ids = set(final_errors) | (set(incomplete_ids) - excluded_ids)
+        if incomplete:
             print(
-                f"completion check failed: {len(incomplete)}/{len(records)} "
-                "selected samples are incomplete; see logs/incomplete_samples.jsonl",
+                f"completion check: {len(incomplete)}/{len(records)} selected "
+                "samples have no accepted output; see logs/incomplete_samples.jsonl",
                 flush=True,
             )
         return BatchResult(
@@ -686,6 +675,7 @@ class BatchPipeline:
             succeeded=counts["succeeded"],
             failed=len(failed_ids),
             skipped=counts["skipped"],
+            excluded=counts["excluded"],
             exported_datasets=exported_datasets,
             exported_prompts=exported_prompts,
             complete=not incomplete,

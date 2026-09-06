@@ -14,8 +14,8 @@ from typing import Any
 from .config import PipelineConfig, load_config
 from .lerobot import SampleRecord, discover_samples
 from .media import MediaPreparer
-from .models import StructuredAnnotation, ValidationResult
-from .pipeline import BatchPipeline, DatasetPromptExporter
+from .models import StructuredAnnotation
+from .pipeline import BatchPipeline, audit_completion
 from .qwen import VLMClient
 from .renderer import PromptRenderer
 
@@ -313,83 +313,21 @@ class PromptAnnotationPipeline:
         records = self._records(
             dataset_glob=dataset_glob, episodes=episodes, limit=limit
         )
-        renderer = PromptRenderer(self._config.renderer)
-        tables: dict[Path, dict[int, dict[str, Any]]] = {}
-        incomplete = []
-        for record in records:
-            reasons: list[str] = []
-            annotation: StructuredAnnotation | None = None
-            rendered: str | None = None
-            annotation_path = (
-                self._config.output_root / "annotations" / f"{record.sample_id}.json"
-            )
-            try:
-                annotation = StructuredAnnotation.model_validate_json(
-                    annotation_path.read_text(encoding="utf-8")
-                )
-                if annotation.sample_id != record.sample_id:
-                    reasons.append("canonical sample_id mismatch")
-                rendered = renderer.render(annotation)
-            except (OSError, ValueError) as error:
-                reasons.append(f"invalid/missing canonical annotation: {error}")
-
-            prompt: str | None = None
-            prompt_path = (
-                self._config.output_root / "prompts" / f"{record.sample_id}.txt"
-            )
-            try:
-                prompt = prompt_path.read_text(encoding="utf-8").strip()
-                if not prompt:
-                    reasons.append("empty final prompt")
-                elif rendered is not None and prompt != rendered:
-                    reasons.append("prompt differs from deterministic render")
-            except OSError as error:
-                reasons.append(f"missing final prompt: {error}")
-
-            if self._config.dataset_prompt_export.enabled:
-                table = tables.get(record.dataset_root)
-                if table is None:
-                    destination = (
-                        record.dataset_root
-                        / "meta"
-                        / self._config.dataset_prompt_export.filename
-                    )
-                    try:
-                        table = DatasetPromptExporter.read_existing(destination)
-                    except (OSError, ValueError) as error:
-                        reasons.append(
-                            f"cannot validate consolidated prompt file: {error}"
-                        )
-                        table = {}
-                    tables[record.dataset_root] = table
-                exported = table.get(record.episode_index)
-                if exported is None:
-                    reasons.append("training prompt row is missing")
-                elif annotation is not None and (
-                    exported["prompt"] != prompt
-                    or exported["reference_view"] != annotation.reference.view
-                    or exported["reference_frame_index"]
-                    != annotation.reference.frame_index
-                ):
-                    reasons.append(
-                        "training export differs from prompt/reference annotation"
-                    )
-
-            if reasons:
-                incomplete.append(
-                    {
-                        "sample_id": record.sample_id,
-                        "dataset": record.dataset_name,
-                        "episode": record.episode_index,
-                        "reasons": reasons,
-                    }
-                )
+        incomplete = audit_completion(self._config, records)
         return {
             "complete": not incomplete,
             "selected": len(records),
             "ready": len(records) - len(incomplete),
             "incomplete": len(incomplete),
-            "first_incomplete": incomplete[:show],
+            "first_incomplete": [
+                {
+                    "sample_id": item["sample_id"],
+                    "dataset": Path(item["dataset_root"]).name,
+                    "episode": item["episode_index"],
+                    "reasons": item["reasons"],
+                }
+                for item in incomplete[:show]
+            ],
         }
 
     def render(
@@ -411,7 +349,4 @@ class PromptAnnotationPipeline:
 
     @staticmethod
     def schemas() -> dict[str, dict[str, Any]]:
-        return {
-            "annotation": StructuredAnnotation.model_json_schema(),
-            "critique": ValidationResult.model_json_schema(),
-        }
+        return {"annotation": StructuredAnnotation.model_json_schema()}
