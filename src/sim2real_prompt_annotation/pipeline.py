@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import threading
@@ -19,16 +20,56 @@ from .lerobot import SampleRecord, discover_samples
 from .media import (
     MediaPreparer,
     PreparedMedia,
-    ReferenceInputError,
 )
 from .models import StructuredAnnotation, ValidationResult
 from .qwen import QwenOpenAIClient, ResponseParseError, VLMClient, VLMResponse
+from .references import build_reference_artifacts
 from .renderer import PromptRenderer
 from .task_metadata import canonical_robot_description, task_contract
 from .validation import (
     canonicalize_annotation,
     find_local_issues,
 )
+
+
+def _validated_reference_row(record: SampleRecord, path: Path) -> dict[str, Any]:
+    """Load one canonical Multi-Reference sidecar and verify its image identities."""
+
+    row = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(row, dict) or row.get("episode_index") != record.episode_index:
+        raise ValueError(f"invalid episode identity in {path}")
+    references = row.get("references")
+    if not isinstance(references, list) or not references:
+        raise ValueError(f"missing Multi-Reference list in {path}")
+    reference_ids: list[str] = []
+    dataset_root = record.dataset_root.resolve()
+    for index, reference in enumerate(references):
+        if not isinstance(reference, dict):
+            raise ValueError(f"Reference {index} in {path} must be an object")
+        reference_id = reference.get("reference_id")
+        relative_path = reference.get("reference_path")
+        if not isinstance(reference_id, str) or not reference_id:
+            raise ValueError(f"Reference {index} in {path} has no reference_id")
+        if not isinstance(relative_path, str) or not relative_path:
+            raise ValueError(f"Reference {index} in {path} has no reference_path")
+        image_path = (dataset_root / relative_path).resolve()
+        try:
+            image_path.relative_to(dataset_root)
+        except ValueError as error:
+            raise ValueError(
+                f"Reference path escapes dataset root: {image_path}"
+            ) from error
+        payload = image_path.read_bytes()
+        expected_digest = reference.get("sha256")
+        if (
+            isinstance(expected_digest, str)
+            and hashlib.sha256(payload).hexdigest() != expected_digest
+        ):
+            raise ValueError(f"Reference digest mismatch: {image_path}")
+        reference_ids.append(reference_id)
+    if len(set(reference_ids)) != len(reference_ids):
+        raise ValueError(f"duplicate reference_id in {path}")
+    return row
 
 
 class AnnotationService:
@@ -103,8 +144,12 @@ class AnnotationService:
             "- target_visuals uses short, coarse appearance phrases: workspace at "
             "most 6 words, background at most 8, and lighting at most 6. Do not list "
             "incidental objects or frame-specific states.\n"
-            "- Reference describes appearance visibility only. It never supplies "
-            "task semantics, dynamics, destinations, or completion requirements.\n"
+            "- The supplied Reference is the exact Real first-frame crop source. "
+            "reference_candidates must include separate normalized boxes for every "
+            "visible task object and useful robot/workspace/background/environment "
+            "region. It never supplies task semantics or dynamics.\n"
+            "- The final renderer emits one natural video-content sentence without "
+            "Match/Render/reference-image instructions.\n"
             f"- The deterministic renderer targets "
             f"{self.config.renderer.target_prompt_words} words and enforces at most "
             f"{self.config.renderer.max_prompt_words} words and "
@@ -210,6 +255,27 @@ class DatasetPromptExporter:
     def _annotation_path(self, record: SampleRecord) -> Path:
         return self.output_root / "annotations" / f"{record.sample_id}.json"
 
+    def _reference_path(self, record: SampleRecord) -> Path:
+        return self.output_root / "references" / f"{record.sample_id}.json"
+
+    @staticmethod
+    def _read_jsonl(path: Path) -> list[dict[str, Any]]:
+        rows: list[dict[str, Any]] = []
+        with path.open(encoding="utf-8") as handle:
+            for line_number, line in enumerate(handle, 1):
+                if not line.strip():
+                    continue
+                try:
+                    row = json.loads(line)
+                except json.JSONDecodeError as error:
+                    raise ValueError(
+                        f"{path}:{line_number}: invalid JSON: {error}"
+                    ) from error
+                if not isinstance(row, dict):
+                    raise ValueError(f"{path}:{line_number}: expected an object")
+                rows.append(row)
+        return rows
+
     @staticmethod
     def _read_existing(path: Path) -> dict[int, dict[str, Any]]:
         if not path.is_file():
@@ -233,6 +299,7 @@ class DatasetPromptExporter:
                         f"{path}:{line_number}: duplicate episode {episode_index}"
                     )
                 prompt = row.get("prompt")
+                reference_ids = row.get("reference_ids")
                 view = row.get("reference_view")
                 frame = row.get("reference_frame_index")
                 if not isinstance(prompt, str) or not prompt.strip():
@@ -240,19 +307,34 @@ class DatasetPromptExporter:
                         f"{path}:{line_number}: expected one non-empty prompt string; "
                         "legacy prompt variants are not supported"
                     )
-                if not isinstance(view, str) or not view.strip():
-                    raise ValueError(f"{path}:{line_number}: expected reference_view")
-                if not isinstance(frame, int) or frame < 0:
-                    raise ValueError(
-                        f"{path}:{line_number}: expected non-negative "
-                        "reference_frame_index"
+                if reference_ids is not None and (
+                    not isinstance(reference_ids, list)
+                    or not reference_ids
+                    or any(
+                        not isinstance(value, str) or not value
+                        for value in reference_ids
                     )
-                result[episode_index] = {
+                ):
+                    raise ValueError(f"{path}:{line_number}: invalid reference_ids")
+                if reference_ids is None and (
+                    not isinstance(view, str)
+                    or not view.strip()
+                    or not isinstance(frame, int)
+                    or frame < 0
+                ):
+                    raise ValueError(
+                        f"{path}:{line_number}: expected Reference identity"
+                    )
+                parsed = {
                     "episode_index": episode_index,
                     "prompt": prompt.strip(),
-                    "reference_view": view.strip(),
-                    "reference_frame_index": frame,
                 }
+                if reference_ids is not None:
+                    parsed["reference_ids"] = reference_ids
+                else:
+                    parsed["reference_view"] = view.strip()
+                    parsed["reference_frame_index"] = frame
+                result[episode_index] = parsed
         return result
 
     @classmethod
@@ -297,28 +379,46 @@ class DatasetPromptExporter:
                     rows = {}
             else:
                 rows = {}
+            reference_destination = dataset_root / "meta/reference_images.jsonl"
+            reference_rows: dict[int, dict[str, Any]] = {}
+            if self.config.merge_existing and reference_destination.is_file():
+                with reference_destination.open(encoding="utf-8") as handle:
+                    for line in handle:
+                        if line.strip():
+                            value = json.loads(line)
+                            reference_rows[int(value["episode_index"])] = value
             updated = 0
             for record in dataset_records:
                 prompt_path = self._prompt_path(record)
                 annotation_path = self._annotation_path(record)
-                if not prompt_path.is_file() or not annotation_path.is_file():
+                reference_path = self._reference_path(record)
+                if (
+                    not prompt_path.is_file()
+                    or not annotation_path.is_file()
+                    or not reference_path.is_file()
+                ):
                     continue
                 prompt = prompt_path.read_text(encoding="utf-8").strip()
                 if not prompt:
                     raise ValueError(f"Final prompt is empty: {prompt_path}")
-                annotation = StructuredAnnotation.model_validate_json(
+                StructuredAnnotation.model_validate_json(
                     annotation_path.read_text(encoding="utf-8")
                 )
+                reference_row = _validated_reference_row(record, reference_path)
+                reference_ids = [
+                    item["reference_id"] for item in reference_row["references"]
+                ]
                 rows[record.episode_index] = {
                     "episode_index": record.episode_index,
                     "prompt": prompt,
-                    "reference_view": annotation.reference.view,
-                    "reference_frame_index": annotation.reference.frame_index,
+                    "reference_ids": reference_ids,
                 }
+                reference_rows[record.episode_index] = reference_row
                 updated += 1
             if not updated:
                 continue
             self._atomic_write_rows(destination, rows)
+            self._atomic_write_rows(reference_destination, reference_rows)
             dataset_count += 1
             prompt_count += updated
         return dataset_count, prompt_count
@@ -333,6 +433,7 @@ def audit_completion(
     renderer = PromptRenderer(config.renderer)
     exporter = DatasetPromptExporter(config.dataset_prompt_export, config.output_root)
     exported_tables: dict[Path, dict[int, dict[str, Any]]] = {}
+    exported_reference_tables: dict[Path, dict[int, dict[str, Any]]] = {}
     incomplete: list[dict[str, Any]] = []
     for record in records:
         reasons: list[str] = []
@@ -362,6 +463,16 @@ def audit_completion(
         except OSError as error:
             reasons.append(f"missing final prompt: {error}")
 
+        reference_ids: list[str] = []
+        reference_path = config.output_root / "references" / f"{record.sample_id}.json"
+        try:
+            reference_row = _validated_reference_row(record, reference_path)
+            reference_ids = [
+                reference["reference_id"] for reference in reference_row["references"]
+            ]
+        except (OSError, ValueError, json.JSONDecodeError) as error:
+            reasons.append(f"invalid/missing canonical Multi-Reference: {error}")
+
         if config.dataset_prompt_export.enabled:
             destination = (
                 record.dataset_root / "meta" / config.dataset_prompt_export.filename
@@ -375,14 +486,40 @@ def audit_completion(
                 row = None
             if row is None:
                 reasons.append("consolidated prompt row is missing")
-            elif annotation is not None and (
-                row["prompt"] != prompt
-                or row["reference_view"] != annotation.reference.view
-                or row["reference_frame_index"] != annotation.reference.frame_index
-            ):
-                reasons.append(
-                    "consolidated prompt/reference differs from canonical output"
-                )
+            elif annotation is not None and row["prompt"] != prompt:
+                reasons.append("consolidated prompt differs from canonical output")
+            elif row.get("reference_ids") != reference_ids:
+                reasons.append("consolidated prompt has different Reference identities")
+
+            reference_destination = record.dataset_root / "meta/reference_images.jsonl"
+            try:
+                if reference_destination not in exported_reference_tables:
+                    exported_reference_tables[reference_destination] = {
+                        int(item["episode_index"]): item
+                        for item in DatasetPromptExporter._read_jsonl(
+                            reference_destination
+                        )
+                    }
+                consolidated_reference = exported_reference_tables[
+                    reference_destination
+                ].get(record.episode_index)
+                consolidated_ids = [
+                    reference["reference_id"]
+                    for reference in consolidated_reference["references"]
+                ]
+            except (
+                OSError,
+                ValueError,
+                KeyError,
+                TypeError,
+                json.JSONDecodeError,
+            ) as error:
+                reasons.append(f"cannot validate consolidated Reference file: {error}")
+            else:
+                if consolidated_ids != reference_ids:
+                    reasons.append(
+                        "consolidated Reference identities differ from canonical output"
+                    )
 
         if reasons:
             incomplete.append(
@@ -425,6 +562,7 @@ class BatchPipeline:
     def _prepare_directories(self) -> None:
         for relative in (
             "annotations",
+            "references",
             "validations",
             "prompts",
             "logs",
@@ -452,9 +590,14 @@ class BatchPipeline:
     def _prompt_path(self, sample_id: str) -> Path:
         return self.config.output_root / "prompts" / f"{sample_id}.txt"
 
-    def _render_existing(self, sample_id: str) -> bool:
+    def _reference_path(self, sample_id: str) -> Path:
+        return self.config.output_root / "references" / f"{sample_id}.json"
+
+    def _render_existing(self, record: SampleRecord) -> bool:
+        sample_id = record.sample_id
         path = self._annotation_path(sample_id)
-        if not path.is_file():
+        reference_path = self._reference_path(sample_id)
+        if not path.is_file() or not reference_path.is_file():
             return False
         try:
             annotation = StructuredAnnotation.model_validate_json(
@@ -462,8 +605,9 @@ class BatchPipeline:
             )
             if annotation.sample_id != sample_id:
                 return False
+            _validated_reference_row(record, reference_path)
             prompt = self.renderer.render(annotation)
-        except (OSError, ValueError):
+        except (OSError, ValueError, json.JSONDecodeError):
             return False
         output = self._prompt_path(sample_id)
         try:
@@ -539,7 +683,7 @@ class BatchPipeline:
         return "excluded"
 
     def _process(self, record: SampleRecord) -> str:
-        if self.config.batch.skip_completed and self._render_existing(record.sample_id):
+        if self.config.batch.skip_completed and self._render_existing(record):
             return "skipped"
 
         if not record.task:
@@ -547,15 +691,18 @@ class BatchPipeline:
         if not record.robot_type:
             return self._exclude(record, "missing authoritative robot_type metadata")
 
-        try:
-            media = self.media_preparer.prepare(record)
-        except ReferenceInputError as error:
-            return self._exclude(record, str(error))
+        media = self.media_preparer.prepare(record)
 
         response = self.service.annotate(record, media)
         self._log_usage(record.sample_id, "annotation", response)
         annotation = StructuredAnnotation.model_validate(response.payload.model_dump())
         canonical = canonicalize_annotation(annotation)
+        try:
+            reference_artifacts = build_reference_artifacts(
+                record, canonical.reference_candidates, self.config.media
+            )
+        except ValueError as error:
+            return self._exclude(record, str(error))
         prompt = self.renderer.render(canonical)
         validation = self._quality_check(record, canonical, prompt)
         self._atomic_write(
@@ -569,6 +716,29 @@ class BatchPipeline:
                 f"quality check rejected candidate with {severe_count} error(s)",
                 validation,
             )
+
+        for artifact in reference_artifacts:
+            artifact.path.parent.mkdir(parents=True, exist_ok=True)
+            temporary = artifact.path.with_name(
+                f".{artifact.path.name}.tmp.{os.getpid()}.{threading.get_ident()}"
+            )
+            temporary.write_bytes(artifact.jpeg)
+            os.replace(temporary, artifact.path)
+        self._atomic_write(
+            self._reference_path(record.sample_id),
+            json.dumps(
+                {
+                    "schema_version": 2,
+                    "episode_index": record.episode_index,
+                    "reference_seed": self.config.media.reference_seed,
+                    "references": [artifact.row for artifact in reference_artifacts],
+                },
+                ensure_ascii=False,
+                indent=2,
+                sort_keys=True,
+            )
+            + "\n",
+        )
 
         self._atomic_write(self._prompt_path(record.sample_id), prompt + "\n")
         # Canonical annotation is the completion marker and is written last.

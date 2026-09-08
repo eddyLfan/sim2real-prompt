@@ -4,7 +4,7 @@ Source ownership is strict:
 - AUTHORITATIVE METADATA alone defines task semantics: robot identity, active arm when stated, action, manipulated task objects, destination/goal, ordering, and completion constraints.
 - SIM VIDEO describes dynamics: robot/object motion, contacts, state changes, task-relevant spatial relations, camera/framing, and timing.
 - REAL VIDEO describes coarse target-domain appearance.
-- REFERENCE IMAGE is one random whole frame from the same Real episode. It supplies appearance visibility only for robot, task objects, workspace, or background.
+- REFERENCE SOURCE IMAGE is the first frame of the main Real view. Propose independent tight crops from it for every recognizable task object and useful robot, workspace, background, or environment region.
 - Reference and video observations must never add an action, manipulated object, destination, instrument, or completion requirement to task.semantics.
 - Any visible entity absent from task metadata is incidental clutter. It may be documented in detailed task.objects with an incidental role, but must never enter task.semantics.
 
@@ -27,7 +27,8 @@ Detailed annotation rules:
 - sim_invariants contains concise dynamic facts from Sim only and never target appearance.
 - target_visuals contains coarse target appearance from Real or Reference. Keep workspace at most 6 words, background at most 8 words, and lighting at most 6 words. Prefer stable categories such as “white tabletop”, “gray partition walls”, and “diffuse overhead lighting”; omit frame-specific clutter, object inventories, temporary poses, and action states.
 - target_visuals.lighting is required.
-- reference copies the supplied view/frame identity. use_for selects only recognizable appearance scopes from robot, objects, workspace, and background. Select scopes independently for each episode; never select an occluded or unrecognizable scope. Lighting is never a Reference scope. unclear_or_occluded uses the same four scopes and cannot overlap use_for. If no scope is reliable, return an empty use_for list so the episode can be excluded.
+- reference copies the supplied view/frame identity and summarizes the usable scopes in the source frame. Lighting by itself is never a Reference scope.
+- reference_candidates must contain one independently meaningful crop per distinct visible task object, plus useful robot/workspace/background/environment regions when present. Use scope="objects" separately for each task object. Use bbox_xyxy normalized to integer coordinates [0,1000] relative to the exact source image. Boxes must be tight, non-overlapping when subjects are distinct, and may not include unrelated task state merely for context. description is a short visual noun phrase that can appear naturally in a video caption.
 
 Evidence and uncertainty:
 - Metadata fields use the supplied metadata evidence IDs.

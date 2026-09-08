@@ -25,7 +25,10 @@ media:
   jpeg_quality: 85
   views: []                   # empty means every paired view
   reference_view: camera_head
-  reference_seed: 42          # reproducibly random frame per episode
+  reference_seed: 42          # retained in exported provenance metadata
+  reference_crop_padding: 0.12
+  reference_min_confidence: 0.55
+  reference_pool_max_images: 8
   native_video_fps: 2.0
   max_native_video_mb: 100
 
@@ -35,8 +38,8 @@ annotation:
   retry_count: 2
 
 renderer:
-  target_prompt_words: 55    # generation target; keep normal prompts compact
-  max_prompt_words: 64       # hard QC ceiling for necessary detail/model variance
+  target_prompt_words: 40    # one compact natural video-content sentence
+  max_prompt_words: 56       # hard QC ceiling for necessary detail/model variance
   max_prompt_characters: 560
 
 batch:

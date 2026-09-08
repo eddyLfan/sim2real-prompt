@@ -10,12 +10,13 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 Source = Literal["metadata", "sim", "real", "reference", "pair", "inference"]
 Severity = Literal["warning", "error"]
 ActiveArm = Literal["left", "right", "both", "unspecified"]
-ReferenceScope = Literal["robot", "objects", "workspace", "background"]
+ReferenceScope = Literal["robot", "objects", "workspace", "background", "environment"]
 REFERENCE_SCOPE_ORDER: tuple[ReferenceScope, ...] = (
     "robot",
     "objects",
     "workspace",
     "background",
+    "environment",
 )
 IssueCategory = Literal[
     "unsupported_claim",
@@ -237,12 +238,43 @@ class ReferenceDescription(StrictModel):
         return self
 
 
+class ReferenceCandidate(StrictModel):
+    """One independently usable crop proposed on the Real first frame."""
+
+    scope: ReferenceScope
+    label: str = Field(min_length=1, max_length=80)
+    description: str = Field(min_length=1, max_length=160)
+    bbox_xyxy: tuple[int, int, int, int]
+    confidence: float = Field(ge=0.0, le=1.0)
+
+    @field_validator("label", "description")
+    @classmethod
+    def normalize_candidate_text(cls, value: str) -> str:
+        value = clean_text(value).strip(" .;:,!")
+        if not value:
+            raise ValueError("candidate text must be non-empty")
+        return value
+
+    @field_validator("bbox_xyxy")
+    @classmethod
+    def validate_bbox(
+        cls, value: tuple[int, int, int, int]
+    ) -> tuple[int, int, int, int]:
+        x1, y1, x2, y2 = value
+        if not all(0 <= coordinate <= 1000 for coordinate in value):
+            raise ValueError("bbox coordinates must be normalized integers in [0,1000]")
+        if x2 <= x1 or y2 <= y1:
+            raise ValueError("bbox must have positive width and height")
+        return value
+
+
 class StructuredAnnotation(StrictModel):
     sample_id: str = Field(min_length=1)
     task: TaskDescription
     sim_invariants: SimInvariants
     target_visuals: TargetVisuals
     reference: ReferenceDescription
+    reference_candidates: list[ReferenceCandidate] = Field(min_length=1, max_length=12)
 
 
 class ValidationIssue(StrictModel):

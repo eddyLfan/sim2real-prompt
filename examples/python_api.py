@@ -7,7 +7,7 @@ pipeline = PromptAnnotationPipeline("config.yaml")
 # Metadata-only discovery; no API key is needed.
 print(pipeline.inspect(dataset_glob="paired_task_*", limit=3))
 
-# This also reports the reproducibly random Reference frame without API access.
+# This also reports the fixed Real first-frame crop source without API access.
 print(
     pipeline.run(
         dataset_glob="paired_task_*",

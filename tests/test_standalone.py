@@ -18,8 +18,16 @@ class StandalonePackageTest(unittest.TestCase):
         self.assertFalse((project_root / "api.py").exists())
 
     def test_only_facade_is_public(self) -> None:
-        self.assertEqual(package.__all__, ["PromptAnnotationPipeline"])
+        self.assertEqual(
+            package.__all__,
+            [
+                "DatasetProcessingPipeline",
+                "PromptAnnotationPipeline",
+                "inspect_dataset",
+            ],
+        )
         self.assertTrue(callable(package.PromptAnnotationPipeline))
+        self.assertTrue(callable(package.inspect_dataset))
 
     def test_has_no_omini_s2r_compatibility_contract(self) -> None:
         project_root = Path(__file__).resolve().parents[1]

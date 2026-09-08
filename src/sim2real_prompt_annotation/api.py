@@ -17,6 +17,7 @@ from .media import MediaPreparer
 from .models import StructuredAnnotation
 from .pipeline import BatchPipeline, audit_completion
 from .qwen import VLMClient
+from .references import build_reference_artifacts
 from .renderer import PromptRenderer
 
 
@@ -136,7 +137,7 @@ class PromptAnnotationPipeline:
         full_resolution: bool = True,
         jpeg_quality: int = 95,
     ) -> dict[str, Any]:
-        """Export deterministic Reference JPEGs and their identity manifest."""
+        """Rebuild Multi-Reference crops from existing canonical annotations."""
 
         directory = Path(directory_name)
         if directory.name != directory_name or directory_name in {"", ".", ".."}:
@@ -149,48 +150,51 @@ class PromptAnnotationPipeline:
         )
         if not records:
             raise ValueError("No paired LeRobot samples matched the selection")
-        preparer = MediaPreparer(self._config.media)
         grouped_rows: dict[Path, dict[int, dict[str, Any]]] = {}
         written = 0
         skipped = 0
         first_references: list[dict[str, Any]] = []
 
         for record in records:
-            reference = preparer.reference(
+            annotation_path = (
+                self._config.output_root / "annotations" / f"{record.sample_id}.json"
+            )
+            if not annotation_path.is_file():
+                raise ValueError(
+                    "Canonical annotation is required before crop export: "
+                    f"{annotation_path}"
+                )
+            annotation = StructuredAnnotation.model_validate_json(
+                annotation_path.read_text(encoding="utf-8")
+            )
+            artifacts = build_reference_artifacts(
                 record,
+                annotation.reference_candidates,
+                self._config.media,
+                directory_name=directory_name,
                 full_resolution=full_resolution,
                 jpeg_quality=jpeg_quality,
             )
-            destination = (
-                record.dataset_root
-                / directory_name
-                / f"episode_{record.episode_index:06d}.jpg"
-            )
-            digest = hashlib.sha256(reference.jpeg).hexdigest()
-            relative_path = destination.relative_to(record.dataset_root).as_posix()
             row = {
+                "schema_version": 2,
                 "episode_index": record.episode_index,
-                "reference_view": reference.view,
-                "reference_frame_index": reference.frame_index,
-                "reference_path": relative_path,
                 "reference_seed": self._config.media.reference_seed,
-                "sha256": digest,
+                "references": [artifact.row for artifact in artifacts],
             }
-
-            if destination.is_file():
-                current_digest = hashlib.sha256(destination.read_bytes()).hexdigest()
-                if current_digest == digest:
-                    skipped += 1
-                elif not overwrite:
-                    raise ValueError(
-                        f"Reference image already exists with different content: "
-                        f"{destination}; pass overwrite=True to replace it"
-                    )
-                else:
-                    self._atomic_write_bytes(destination, reference.jpeg)
-                    written += 1
-            else:
-                self._atomic_write_bytes(destination, reference.jpeg)
+            for artifact in artifacts:
+                if artifact.path.is_file():
+                    current_digest = hashlib.sha256(
+                        artifact.path.read_bytes()
+                    ).hexdigest()
+                    if current_digest == artifact.row["sha256"]:
+                        skipped += 1
+                        continue
+                    if not overwrite:
+                        raise ValueError(
+                            f"Reference image already exists with different content: "
+                            f"{artifact.path}; pass overwrite=True to replace it"
+                        )
+                self._atomic_write_bytes(artifact.path, artifact.jpeg)
                 written += 1
 
             rows = grouped_rows.get(record.dataset_root)
@@ -200,8 +204,15 @@ class PromptAnnotationPipeline:
                 )
                 grouped_rows[record.dataset_root] = rows
             rows[record.episode_index] = row
-            if len(first_references) < 3:
-                first_references.append(row)
+            self._atomic_write_bytes(
+                self._config.output_root / "references" / f"{record.sample_id}.json",
+                (
+                    json.dumps(row, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
+                ).encode(),
+            )
+            for reference in row["references"]:
+                if len(first_references) < 3:
+                    first_references.append(reference)
 
         for dataset_root, rows in grouped_rows.items():
             self._atomic_write_jsonl(

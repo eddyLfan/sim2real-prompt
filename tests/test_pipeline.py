@@ -4,7 +4,6 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import patch
 
 import cv2
 import numpy as np
@@ -20,6 +19,7 @@ from sim2real_prompt_annotation.media import (
 from sim2real_prompt_annotation.models import (
     EvidenceText,
     MetadataGroundedText,
+    ReferenceCandidate,
     ReferenceDescription,
     SimInvariants,
     StructuredAnnotation,
@@ -182,6 +182,22 @@ def _annotation(
             use_for=["robot", "objects", "workspace", "background"],
             unclear_or_occluded=[],
         ),
+        reference_candidates=[
+            ReferenceCandidate(
+                scope="objects",
+                label="blue mug",
+                description="a blue ceramic mug",
+                bbox_xyxy=(200, 200, 500, 800),
+                confidence=0.95,
+            ),
+            ReferenceCandidate(
+                scope="workspace",
+                label="workbench",
+                description="a gray workbench",
+                bbox_xyxy=(50, 500, 950, 950),
+                confidence=0.9,
+            ),
+        ],
     )
 
 
@@ -245,7 +261,7 @@ class PipelineTest(unittest.TestCase):
         self.assertEqual(cup.active_arm, "left")
         self.assertEqual(cup.task_payload, "左臂将绿色杯放到黑色杯垫")
 
-    def test_prompt_media_requires_reference_directory_input(self) -> None:
+    def test_prompt_media_uses_real_first_frame_as_crop_source(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             dataset = _make_dataset(root / "data")
@@ -253,10 +269,11 @@ class PipelineTest(unittest.TestCase):
                 {"dataset_root": dataset.parent, "output_root": root / "outputs"}
             )
             record = pipeline._records(dataset_glob="paired_demo")[0]
-            with self.assertRaisesRegex(ValueError, "missing or invalid Reference"):
-                MediaPreparer(pipeline._config.media).prepare(record)
+            reference = MediaPreparer(pipeline._config.media).prepare(record).reference
+            assert reference is not None
+            self.assertEqual(reference.frame_index, 0)
 
-    def test_missing_reference_is_excluded_without_api_call(self) -> None:
+    def test_pipeline_builds_references_without_preexisting_reference(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             dataset = _make_dataset(root / "data")
@@ -273,15 +290,13 @@ class PipelineTest(unittest.TestCase):
 
             result = pipeline.run(dataset_glob="paired_demo")
 
-            self.assertEqual(result["excluded"], 1)
+            self.assertEqual(result["excluded"], 0)
             self.assertEqual(result["failed"], 0)
-            self.assertFalse(result["complete"])
-            self.assertEqual(client.stages, [])
-            exclusion = json.loads(
-                (output / "logs/excluded_samples.jsonl").read_text(encoding="utf-8")
+            self.assertTrue(result["complete"])
+            self.assertEqual(client.stages, ["annotation"])
+            self.assertTrue(
+                (dataset / "Reference/episode_000000/reference_00.jpg").is_file()
             )
-            self.assertEqual(exclusion["episode_index"], 0)
-            self.assertIn("missing or invalid Reference", exclusion["reason"])
 
     def test_frame_limits_match_qwen_video_contract(self) -> None:
         self.assertFalse(hasattr(PromptAnnotationPipeline()._config, "critic"))
@@ -307,14 +322,14 @@ class PipelineTest(unittest.TestCase):
         self.assertFalse(any(item["type"] == "video" for item in content))
         self.assertEqual(sum(item["type"] == "image_url" for item in content), 3)
 
-    def test_prompt_uses_55_word_target_and_64_word_hard_limit(self) -> None:
+    def test_prompt_uses_40_word_target_and_56_word_hard_limit(self) -> None:
         config = PromptAnnotationPipeline()._config.renderer
-        self.assertEqual(config.target_prompt_words, 55)
-        self.assertEqual(config.max_prompt_words, 64)
+        self.assertEqual(config.target_prompt_words, 40)
+        self.assertEqual(config.max_prompt_words, 56)
         renderer = PromptRenderer(config)
-        renderer.validate_length(" ".join(["word"] * 64))
+        renderer.validate_length(" ".join(["word"] * 56))
         with self.assertRaises(PromptLengthError):
-            renderer.validate_length(" ".join(["word"] * 65))
+            renderer.validate_length(" ".join(["word"] * 57))
 
     def test_reference_frame_supports_real_target_appearance(self) -> None:
         annotation = _annotation("sample", "camera_head", 0)
@@ -388,8 +403,6 @@ class PipelineTest(unittest.TestCase):
                 },
                 client=client,
             )
-            pipeline.export_references(dataset_glob="paired_demo")
-
             result = pipeline.run(dataset_glob="paired_demo")
 
             self.assertEqual(result["failed"], 1)
@@ -422,17 +435,13 @@ class PipelineTest(unittest.TestCase):
         prompt = PromptRenderer(PromptAnnotationPipeline()._config.renderer).render(
             annotation
         )
-        self.assertEqual(prompt.count("Real-world video of"), 1)
-        self.assertEqual(prompt.count("Render the scene with"), 1)
-        self.assertIn("using its manipulators to place a blue mug", prompt)
-        self.assertIn(
-            "Match robot appearance, task-object appearance, workspace appearance, "
-            "and background appearance to the reference image.",
-            prompt,
-        )
+        self.assertNotIn("Real-world video of", prompt)
+        self.assertNotIn("Render the scene with", prompt)
+        self.assertIn("using its manipulators to place a blue ceramic mug", prompt)
+        self.assertNotIn("reference image", prompt)
         self.assertNotIn("white cup", prompt)
 
-    def test_renderer_uses_episode_specific_reference_scopes(self) -> None:
+    def test_renderer_is_a_single_natural_video_content_sentence(self) -> None:
         annotation = _annotation("sample", "camera_head", 0)
         annotation.reference.use_for = ["robot", "workspace"]
         annotation.reference.unclear_or_occluded = ["objects", "background"]
@@ -441,35 +450,16 @@ class PipelineTest(unittest.TestCase):
             annotation
         )
 
-        self.assertIn(
-            "Match robot appearance and workspace appearance to the reference image.",
-            prompt,
-        )
-        self.assertNotIn("task-object appearance", prompt)
-        self.assertNotIn("background appearance", prompt)
+        self.assertEqual(prompt.count("."), 1)
+        self.assertIn("gray workbench", prompt)
+        self.assertIn("soft overhead lighting", prompt)
 
-    def test_reference_without_usable_scope_is_rejected(self) -> None:
+    def test_annotation_requires_at_least_one_reference_candidate(self) -> None:
         annotation = _annotation("sample", "camera_head", 0)
-        annotation.reference.use_for = []
-        annotation.reference.unclear_or_occluded = [
-            "robot",
-            "objects",
-            "workspace",
-            "background",
-        ]
-        renderer = PromptRenderer(PromptAnnotationPipeline()._config.renderer)
-
-        validation = find_local_issues(
-            annotation,
-            {"task": "place blue mug onto black tray", "robot_type": "dual_arm"},
-            renderer.render(annotation),
-            renderer=renderer,
-        )
-
-        self.assertTrue(validation.has_severe_errors())
-        self.assertTrue(
-            any(issue.field == "reference.use_for" for issue in validation.issues)
-        )
+        payload = annotation.model_dump()
+        payload["reference_candidates"] = []
+        with self.assertRaises(ValidationError):
+            StructuredAnnotation.model_validate(payload)
 
     def test_task_contract_does_not_use_character_coverage_as_a_gate(self) -> None:
         annotation = _annotation("sample", "camera_head", 0)
@@ -558,8 +548,8 @@ class PipelineTest(unittest.TestCase):
         prompt = PromptRenderer(PromptAnnotationPipeline()._config.renderer).render(
             annotation
         )
-        self.assertIn("place a blue mug onto a black tray", prompt)
-        self.assertNotIn("a blue mug and a black tray", prompt)
+        self.assertIn("place a blue ceramic mug onto a black tray", prompt)
+        self.assertNotIn("a blue ceramic mug and a black tray", prompt)
 
     def test_renderer_bounds_appearance_without_changing_annotation(self) -> None:
         annotation = _annotation("sample", "camera_head", 0)
@@ -588,15 +578,13 @@ class PipelineTest(unittest.TestCase):
                     "output_root": output,
                     "media": {"max_frames": 4, "resize_long_edge": 64},
                     "renderer": {
-                        "target_prompt_words": 32,
-                        "max_prompt_words": 40,
+                        "target_prompt_words": 18,
+                        "max_prompt_words": 20,
                     },
                     "batch": {"concurrency": 1, "api_retry_count": 0},
                 },
                 client=client,
             )
-            pipeline.export_references(dataset_glob="paired_demo")
-
             result = pipeline.run(dataset_glob="paired_demo")
 
             self.assertEqual(result["excluded"], 1)
@@ -640,27 +628,6 @@ class PipelineTest(unittest.TestCase):
                 client=client,
             )
 
-            references = pipeline.export_references(dataset_glob="paired_demo")
-            self.assertEqual(references["written"], 1)
-            reference_path = dataset / "Reference/episode_000000.jpg"
-            self.assertTrue(reference_path.is_file())
-            reference_rows = [
-                json.loads(line)
-                for line in (dataset / "meta/reference_images.jsonl")
-                .read_text(encoding="utf-8")
-                .splitlines()
-                if line
-            ]
-            self.assertEqual(len(reference_rows), 1)
-            self.assertEqual(
-                reference_rows[0]["reference_path"],
-                reference_path.relative_to(dataset).as_posix(),
-            )
-
-            resumed_references = pipeline.export_references(dataset_glob="paired_demo")
-            self.assertEqual(resumed_references["written"], 0)
-            self.assertEqual(resumed_references["skipped"], 1)
-
             result = pipeline.run(dataset_glob="paired_demo")
             self.assertEqual(result["succeeded"], 1)
             self.assertEqual(result["failed"], 0)
@@ -673,35 +640,31 @@ class PipelineTest(unittest.TestCase):
             self.assertFalse((dataset / "meta/episodes_prompt.meta.json").exists())
             self.assertIsInstance(row["prompt"], str)
             self.assertNotIn("prompts", row)
-            self.assertEqual(row["reference_view"], "camera_head")
-            self.assertGreaterEqual(row["reference_frame_index"], 0)
-            self.assertLess(row["reference_frame_index"], 6)
-            self.assertIn("Match robot appearance", row["prompt"])
-            self.assertNotIn("Use the", row["prompt"])
-            self.assertNotIn("explicit text attributes take priority", row["prompt"])
-            self.assertIn("Render the scene with", row["prompt"])
-            self.assertEqual(row["prompt"].count("."), 3)
+            self.assertEqual(len(row["reference_ids"]), 2)
+            self.assertNotIn("reference image", row["prompt"])
+            self.assertNotIn("Render the scene with", row["prompt"])
+            self.assertEqual(row["prompt"].count("."), 1)
 
-            records = pipeline._records(dataset_glob="paired_demo")
-            preparer = MediaPreparer(pipeline._config.media)
-            with patch(
-                "sim2real_prompt_annotation.media._probe_video",
-                side_effect=AssertionError("saved Reference should avoid video decode"),
-            ):
-                saved_reference = preparer.reference(records[0])
+            reference_rows = [
+                json.loads(line)
+                for line in (dataset / "meta/reference_images.jsonl")
+                .read_text(encoding="utf-8")
+                .splitlines()
+                if line
+            ]
+            self.assertEqual(len(reference_rows[0]["references"]), 2)
             self.assertEqual(
-                saved_reference.frame_index,
-                reference_rows[0]["reference_frame_index"],
+                row["reference_ids"],
+                [item["reference_id"] for item in reference_rows[0]["references"]],
             )
-            first = preparer.prepare(records[0]).reference
-            second = preparer.prepare(records[0]).reference
-            assert first is not None and second is not None
-            self.assertEqual(first.frame_index, second.frame_index)
-            self.assertEqual(row["reference_frame_index"], first.frame_index)
+
             self.assertEqual(
-                row["reference_frame_index"],
-                reference_rows[0]["reference_frame_index"],
+                reference_rows[0]["references"][0]["source_frame_index"], 0
             )
+
+            resumed_references = pipeline.export_references(dataset_glob="paired_demo")
+            self.assertEqual(resumed_references["written"], 0)
+            self.assertEqual(resumed_references["skipped"], 2)
 
             prompt_path = output / "prompts" / f"{sample_id}.txt"
             prompt_path.write_text("stale prompt\n", encoding="utf-8")

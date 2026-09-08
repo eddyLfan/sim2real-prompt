@@ -146,7 +146,8 @@ class QwenOpenAIClient(VLMClient):
                     {
                         "type": "text",
                         "text": (
-                            f"REFERENCE IMAGE; view={media.reference.view}; "
+                            "REFERENCE SOURCE IMAGE (REAL FIRST FRAME); "
+                            f"view={media.reference.view}; "
                             f"evidence_id={media.reference.evidence_id}"
                         ),
                     },

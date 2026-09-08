@@ -5,14 +5,7 @@ from __future__ import annotations
 import re
 
 from .config import RendererConfig
-from .models import ReferenceScope, StructuredAnnotation, clean_text
-
-SCOPE_TEXT: dict[ReferenceScope, str] = {
-    "robot": "robot appearance",
-    "objects": "task-object appearance",
-    "workspace": "workspace appearance",
-    "background": "background appearance",
-}
+from .models import StructuredAnnotation, clean_text
 
 APPEARANCE_WORD_LIMITS = {"workspace": 6, "background": 8, "lighting": 6}
 
@@ -40,13 +33,6 @@ class PromptRenderer:
         self.config = config
 
     @staticmethod
-    def _reference_instruction(scopes: list[ReferenceScope]) -> str:
-        if not scopes:
-            return "Reference image has no usable appearance scope"
-        labels = _join_natural([SCOPE_TEXT[scope] for scope in scopes])
-        return f"Match {labels} to the reference image"
-
-    @staticmethod
     def _object_is_goal_target(object_text: str, goal_text: str) -> bool:
         """Avoid rendering a destination as both an object and the goal."""
 
@@ -71,7 +57,24 @@ class PromptRenderer:
             "both": "both arms",
             "unspecified": "its manipulators",
         }[slots.active_arm]
-        object_values = [value.text for value in slots.primary_objects]
+        object_values: list[str] = []
+        object_candidates = [
+            candidate
+            for candidate in annotation.reference_candidates
+            if candidate.scope == "objects"
+        ]
+        for value in slots.primary_objects:
+            normalized = value.text.lower()
+            match = next(
+                (
+                    candidate
+                    for candidate in object_candidates
+                    if candidate.label.lower() in normalized
+                    or normalized in candidate.label.lower()
+                ),
+                None,
+            )
+            object_values.append(match.description if match is not None else value.text)
         if slots.goal is not None and len(object_values) > 1:
             retained = [
                 value
@@ -116,14 +119,14 @@ class PromptRenderer:
         return _join_natural(values)
 
     def render(self, annotation: StructuredAnnotation) -> str:
-        sentences = [f"Real-world video of {self.task_text(annotation)}."]
-        sentences.append(
-            f"{self._reference_instruction(annotation.reference.use_for)}."
-        )
+        task = self.task_text(annotation)
+        if task.lower().startswith("the "):
+            task = task[4:]
+        sentence = f"The {task}"
         appearance = self.appearance_text(annotation)
         if appearance:
-            sentences.append(f"Render the scene with {appearance}.")
-        return clean_text(" ".join(sentences))
+            sentence += f" in a scene with {appearance}"
+        return clean_text(sentence.rstrip(". ") + ".")
 
     def validate_length(self, prompt: str) -> None:
         """Validate an already-rendered prompt without coupling this to rendering."""

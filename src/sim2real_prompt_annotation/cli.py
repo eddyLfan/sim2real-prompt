@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any
 
 from .api import PromptAnnotationPipeline
+from .processing import DatasetProcessingPipeline
 
 
 def _pipeline(args: argparse.Namespace) -> PromptAnnotationPipeline:
@@ -88,6 +89,20 @@ def command_schema(args: argparse.Namespace) -> int:
     return 0
 
 
+def command_process(args: argparse.Namespace) -> int:
+    report = DatasetProcessingPipeline(
+        args.dataset,
+        config=args.config,
+        output_root=args.output_root,
+    ).run(
+        check_only=args.check_only,
+        force=args.force,
+        probe_videos=not args.skip_video_probe,
+    )
+    _print_json(report)
+    return {"complete": 0, "needs_processing": 1, "blocked": 2}[report["status"]]
+
+
 def _add_config(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--config", help="Optional path to YAML configuration")
     parser.add_argument("--dataset-root", help="Override the configured dataset root")
@@ -110,6 +125,21 @@ def build_parser() -> argparse.ArgumentParser:
         description="Project-specific compact prompts for paired LeRobot datasets",
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
+
+    process_parser = subparsers.add_parser(
+        "process", help="Validate and build all Multi-Reference/Prompt dataset outputs"
+    )
+    process_parser.add_argument(
+        "--dataset", required=True, help="Paired LeRobot dataset root"
+    )
+    process_parser.add_argument("--config", help="Optional path to YAML configuration")
+    process_parser.add_argument(
+        "--output-root", help="External annotations/reports directory"
+    )
+    process_parser.add_argument("--check-only", action="store_true")
+    process_parser.add_argument("--force", action="store_true")
+    process_parser.add_argument("--skip-video-probe", action="store_true")
+    process_parser.set_defaults(handler=command_process)
 
     inspect_parser = subparsers.add_parser(
         "inspect", help="Inspect bounded paired LeRobot metadata discovery"
@@ -137,7 +167,7 @@ def build_parser() -> argparse.ArgumentParser:
     run_parser.set_defaults(handler=command_run)
 
     reference_parser = subparsers.add_parser(
-        "references", help="Export deterministic same-episode Reference JPEGs"
+        "references", help="Rebuild first-frame semantic Multi-Reference crops"
     )
     _add_config(reference_parser)
     _add_selection(reference_parser)

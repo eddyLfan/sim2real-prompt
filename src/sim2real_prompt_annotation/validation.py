@@ -121,13 +121,13 @@ def find_local_issues(
                 )
             )
 
-    if not annotation.reference.use_for:
+    if not annotation.reference_candidates:
         issues.append(
             _error(
                 "reference_scope_error",
-                "reference.use_for",
-                "no usable appearance scope",
-                "Reference image does not provide any reliable appearance scope.",
+                "reference_candidates",
+                "no usable first-frame crop",
+                "The Real first frame does not provide a reliable Reference crop.",
             )
         )
 

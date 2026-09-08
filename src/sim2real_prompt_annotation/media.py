@@ -273,8 +273,9 @@ class MediaPreparer:
         *,
         full_resolution: bool = False,
         jpeg_quality: int = 95,
+        allow_saved: bool = True,
     ) -> ReferenceImage:
-        """Select the deterministic same-episode Reference frame.
+        """Select the Real first frame used as the deterministic crop source.
 
         Prompt preparation uses the configured resized representation. Dataset
         export can request a full-resolution JPEG while retaining the same view
@@ -284,7 +285,7 @@ class MediaPreparer:
         views = self._views(record) if views is None else views
         if not views:
             raise ValueError(f"{record.sample_id}: no paired views selected")
-        if not full_resolution:
+        if not full_resolution and allow_saved:
             saved = self._saved_reference(record, views)
             if saved is not None:
                 return saved
@@ -292,12 +293,8 @@ class MediaPreparer:
         if view not in record.real_videos:
             view = views[0]
         path = record.real_videos[view]
-        frame_count = _probe_video(path).frame_count
-        digest = hashlib.blake2b(
-            f"{self.config.reference_seed}:{record.sample_id}".encode(),
-            digest_size=8,
-        ).digest()
-        frame_index = int.from_bytes(digest, "little") % frame_count
+        _probe_video(path)
+        frame_index = 0
         frame = _read_raw_frames(path, [frame_index])[frame_index]
         return ReferenceImage(
             view=view,
@@ -314,17 +311,9 @@ class MediaPreparer:
         views = self._views(record)
         if not views:
             raise ValueError(f"{record.sample_id}: no paired views selected")
-        reference = self._saved_reference(record, views)
-        if reference is None:
-            expected = (
-                record.dataset_root
-                / "Reference"
-                / f"episode_{record.episode_index:06d}.jpg"
-            )
-            raise ReferenceInputError(
-                f"{record.sample_id}: missing or invalid Reference input: {expected}; "
-                "export References before prompt annotation"
-            )
+        # Annotation sees the full Real first frame as a crop source. The accepted
+        # candidate boxes are exported only after local validation succeeds.
+        reference = self.reference(record, views, allow_saved=False)
         groups: list[MediaGroup] = []
         for view in views:
             sim_path = record.sim_videos[view]

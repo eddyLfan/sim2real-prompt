@@ -51,6 +51,9 @@ class MediaConfig(ConfigModel):
     views: list[str] = Field(default_factory=list)
     reference_view: str = "camera_head"
     reference_seed: int = 42
+    reference_crop_padding: float = Field(default=0.12, ge=0.0, le=0.5)
+    reference_min_confidence: float = Field(default=0.55, ge=0.0, le=1.0)
+    reference_pool_max_images: int = Field(default=8, ge=1, le=12)
     native_video_fps: float = Field(default=2.0, ge=0.1, le=10.0)
     max_native_video_mb: int = Field(default=100, ge=1)
 
@@ -73,8 +76,8 @@ class AnnotationConfig(ConfigModel):
 
 
 class RendererConfig(ConfigModel):
-    target_prompt_words: int = Field(default=55, ge=15, le=160)
-    max_prompt_words: int = Field(default=64, ge=15, le=160)
+    target_prompt_words: int = Field(default=40, ge=15, le=160)
+    max_prompt_words: int = Field(default=56, ge=15, le=160)
     max_prompt_characters: int = Field(default=560, ge=120, le=2000)
 
     @model_validator(mode="after")
