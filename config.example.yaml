@@ -1,58 +1,73 @@
-# Relative paths are resolved from this YAML file.
-dataset_root: ./data
-output_root: ./outputs
-metadata_manifest: null
+# All relative paths are resolved from this YAML file. Environment overrides:
+# SIM2REAL_PROMPT_DATASET_ROOT and SIM2REAL_PROMPT_OUTPUT_ROOT.
+dataset:
+  root: ./data
+  dataset_glob: "*"
+  real_view: camera_head
+  min_episode_frames: 81
+  # Optional JSON/JSONL keyed by canonical sample_id. It may add metadata but
+  # cannot override split.
+  metadata_manifest: null
+  # Required only when neither meta/episodes.jsonl nor meta/info.json:splits
+  # supplies train/validation. JSONL rows are {"domain": ..., "split": ...}.
+  split_manifest: null
 
-provider:
-  name: qwen_openai
-  model: qwen3.7-plus
-  api_key_env: DASHSCOPE_API_KEY
-  base_url: null
-  base_url_env: DASHSCOPE_BASE_URL
-  response_format: json_object
-  enable_thinking: false
-  timeout_seconds: 180
-
-discovery:
-  min_episode_frames: 1
-  required_views: []
-
-media:
-  mode: selected_frames       # selected_frames | native_video
-  strategy: uniform           # uniform | keyframe
-  max_frames: 6               # selected video sequences use at least 4 images
+# Exactly eight uniformly spaced frames from the configured Real view are sent
+# in one request. The same response contains the final prompt and YOLOE queries.
+prompt:
+  frame_count: 8
+  sampling: uniform
   resize_long_edge: 512
   jpeg_quality: 85
-  views: []                   # empty means every paired view
-  reference_view: camera_head
-  reference_seed: 42          # retained in exported provenance metadata
-  reference_crop_padding: 0.12
-  reference_min_confidence: 0.55
-  reference_pool_max_images: 8
-  native_video_fps: 2.0
-  max_native_video_mb: 100
-
-annotation:
+  system_prompt: ./src/sim2real_prompt_annotation/prompts/prompt_system.txt
   temperature: 0.1
-  max_tokens: 3000
-  retry_count: 2
+  max_tokens: 256
+  provider:
+    name: qwen_openai
+    model: qwen3.7-plus
+    api_key_env: DASHSCOPE_API_KEY
+    base_url: null
+    base_url_env: DASHSCOPE_BASE_URL
+    response_format: json_object
+    enable_thinking: false
+    timeout_seconds: 180
 
-renderer:
-  target_prompt_words: 40    # one compact natural video-content sentence
-  max_prompt_words: 56       # hard QC ceiling for necessary detail/model variance
-  max_prompt_characters: 560
+# YOLOE-11s-seg is the only Reference backend. Put the checkpoint at this path
+# (or replace it with an absolute path); model weights are not included here.
+reference:
+  backend: yoloe
+  model_path: ./weights/yoloe-11s-seg.pt
+  device: cuda:0
+  image_size: 640
+  batch_size: 32
+  embedding_cache_size: 64
+  # Calibrated for open-vocabulary task nouns; mask/area QC remains strict.
+  confidence: 0.15
+  iou_threshold: 0.50
+  duplicate_iou: 0.85
+  crop_padding: 0.12
+  candidate_pool_size: 8
+  min_images: 1
+  max_images: 3
+  selection_seed: 42
+  jpeg_quality: 95
 
-batch:
-  concurrency: 4
+runtime:
+  decode_workers: 4
+  api_concurrency: 4
   api_retry_count: 4
   backoff_initial_seconds: 1.0
   backoff_max_seconds: 30.0
-  skip_completed: true
+  resume: true
+  fail_fast: false
   log_costs: true
   input_cost_per_million: null
   output_cost_per_million: null
 
-dataset_prompt_export:
-  enabled: true
-  filename: episodes_prompt.jsonl
-  merge_existing: true
+# This directory contains resumable branch checkpoints and run_report.json.
+# Training artifacts are published directly under each source dataset root.
+output:
+  root: ./outputs
+  prompt_filename: episodes_prompt.jsonl
+  reference_filename: reference_images.jsonl
+  reference_directory: Reference

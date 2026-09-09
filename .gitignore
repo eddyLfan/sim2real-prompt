@@ -9,6 +9,11 @@ build/
 dist/
 data/
 outputs/
+weights/
+*.pt
+*.onnx
+*.engine
+mobileclip*.ts
 
 # The parent OminiEWM repository ignores test* globally. Keep this project's
 # tests visible when the directory is committed.

@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "sim2real-prompt-annotation"
-version = "0.1.0"
-description = "Project-specific compact prompts for paired Sim/Real LeRobot data"
+version = "0.2.0"
+description = "Real-video Prompt and Multi-Reference preprocessing for paired Sim/Real LeRobot data"
 readme = "README.md"
 requires-python = ">=3.10"
 license = {file = "LICENSE"}
@@ -24,12 +24,14 @@ dependencies = [
   "numpy>=1.24",
   "openai>=1.40,<3",
   "opencv-python-headless>=4.8",
-  "pyarrow>=15",
   "pydantic>=2.0,<3",
   "PyYAML>=6.0,<7",
 ]
 
 [project.optional-dependencies]
+reference = [
+  "ultralytics>=8.4,<9",
+]
 dev = [
   "build>=1.2",
   "pytest>=8.0",
@@ -46,6 +48,7 @@ where = ["src"]
 [tool.setuptools.package-data]
 sim2real_prompt_annotation = [
   "prompts/*.txt",
+  "resources/*.yaml",
   "py.typed",
 ]
 

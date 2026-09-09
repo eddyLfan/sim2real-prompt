@@ -1,168 +1,128 @@
-"""Minimal correctness checks for the final training Prompt."""
+"""Pure validation for prompt and Reference branch products."""
 
 from __future__ import annotations
 
 import re
-from difflib import SequenceMatcher
-from typing import Any
+from collections.abc import Sequence
 
-from .models import (
-    StructuredAnnotation,
-    ValidationIssue,
-    ValidationResult,
-    clean_text,
+from .models import PromptResult, ReferenceBranchResult, ReferenceQuery, clean_text
+
+_PROMPT_FORBIDDEN_PHRASES = (
+    "reference image",
+    "reference crop",
+    "bounding box",
+    "segmentation mask",
+    "sim-to-real",
+    "simulation video",
+    "real video",
+    "input frame",
 )
-from .renderer import PromptLengthError, PromptRenderer
-from .task_metadata import canonical_robot_description, task_contract, task_payload
-
-TRAJECTORY_PHRASES = {
-    "frame-by-frame",
-    "frame by frame",
-    "precise trajectory",
-    "exact trajectory",
-    "action phase",
-    "action phases",
-    "followed by",
-}
 
 
-def _error(category: str, field: str, claim: str, reason: str) -> ValidationIssue:
-    return ValidationIssue(
-        category=category,  # type: ignore[arg-type]
-        field=field,
-        claim=claim,
-        reason=reason,
-        severity="error",
-    )
+class ProductValidationError(ValueError):
+    """A branch product is unsafe to publish to the training dataset."""
 
 
-def _metadata_span_supported(task: str, span: str) -> bool:
-    """Accept exact spans and minor inflection differences, reject foreign concepts."""
-
-    payload = re.sub(r"[^a-z0-9\u4e00-\u9fff]+", "", task_payload(task).lower())
-    needle = re.sub(r"[^a-z0-9\u4e00-\u9fff]+", "", span.lower())
-    if not needle:
-        return False
-    if needle in payload:
-        return True
-    match = SequenceMatcher(None, needle, payload).find_longest_match()
-    return match.size / len(needle) >= 0.8
+def prompt_word_count(prompt: str) -> int:
+    return len(re.findall(r"\b[\w'-]+\b", prompt))
 
 
-def find_local_issues(
-    annotation: StructuredAnnotation,
-    metadata: dict[str, Any],
-    rendered_prompt: str,
+def normalize_prompt(prompt: str) -> str:
+    value = clean_text(prompt).strip()
+    if value and value[-1] not in ".!?":
+        value += "."
+    return value
+
+
+def validate_prompt_result(
+    result: PromptResult,
     *,
-    renderer: PromptRenderer,
-) -> ValidationResult:
-    """Reject only issues that make the final conditioning Prompt incorrect."""
+    max_words: int = 56,
+    max_characters: int = 560,
+) -> PromptResult:
+    """Validate and normalize the one-sentence VLM product."""
 
-    issues: list[ValidationIssue] = []
-    semantics = annotation.task.semantics
-    metadata_task = metadata.get("task")
-    metadata_robot = metadata.get("robot_type")
+    prompt = validate_prompt_text(
+        result.prompt,
+        max_words=max_words,
+        max_characters=max_characters,
+    )
+    if not any(query.role == "primary" for query in result.reference_queries):
+        raise ProductValidationError("VLM returned no primary task-object query")
+    if any(
+        query.role == "primary" and not query.required
+        for query in result.reference_queries
+    ):
+        raise ProductValidationError("every primary task-object query must be required")
+    return result.model_copy(update={"prompt": prompt})
 
-    if metadata_task and semantics.metadata_task != metadata_task:
-        issues.append(
-            _error(
-                "metadata_conflict",
-                "task.semantics.metadata_task",
-                semantics.metadata_task,
-                "Prompt task does not match authoritative task metadata.",
-            )
+
+def validate_prompt_text(
+    value: str,
+    *,
+    max_words: int = 56,
+    max_characters: int = 560,
+) -> str:
+    """Validate and normalize a published prompt without branch metadata."""
+
+    prompt = normalize_prompt(value)
+    if not prompt:
+        raise ProductValidationError("prompt is empty")
+    if len(prompt) > max_characters:
+        raise ProductValidationError(
+            f"prompt has {len(prompt)} characters; maximum is {max_characters}"
         )
-
-    expected_robot = canonical_robot_description(metadata_robot, semantics.robot)
-    if metadata_robot and semantics.robot != expected_robot:
-        issues.append(
-            _error(
-                "metadata_conflict",
-                "task.semantics.robot",
-                semantics.robot,
-                f"Expected canonical robot description: {expected_robot}.",
-            )
+    words = prompt_word_count(prompt)
+    if words > max_words:
+        raise ProductValidationError(
+            f"prompt has {words} words; maximum is {max_words}"
         )
-
-    contract = task_contract(metadata_task)
-    if semantics.active_arm != contract.active_arm:
-        issues.append(
-            _error(
-                "metadata_conflict",
-                "task.semantics.active_arm",
-                semantics.active_arm,
-                f"Task metadata requires active_arm={contract.active_arm}.",
-            )
+    terminals = re.findall(r"[.!?]+(?=\s|$)", prompt)
+    if len(terminals) != 1:
+        raise ProductValidationError("prompt must contain exactly one sentence")
+    lowered = prompt.casefold()
+    forbidden = next(
+        (phrase for phrase in _PROMPT_FORBIDDEN_PHRASES if phrase in lowered), None
+    )
+    if forbidden is not None:
+        raise ProductValidationError(
+            f"prompt exposes preprocessing language: {forbidden!r}"
         )
+    return prompt
 
-    if metadata_task:
-        grounded = [
-            semantics.action,
-            *semantics.primary_objects,
-            *semantics.constraints,
-        ]
-        if semantics.goal is not None:
-            grounded.append(semantics.goal)
-        unsupported = sorted(
-            {
-                value.metadata_span
-                for value in grounded
-                if not _metadata_span_supported(metadata_task, value.metadata_span)
-            }
+
+def validate_reference_result(
+    result: ReferenceBranchResult,
+    queries: Sequence[ReferenceQuery],
+    *,
+    min_images: int = 1,
+    max_images: int = 3,
+) -> ReferenceBranchResult:
+    """Verify detection coverage and the selected 1--3 first-frame crops."""
+
+    selected = result.selected_artifacts
+    if not min_images <= len(selected) <= max_images:
+        raise ProductValidationError(
+            f"Reference count {len(selected)} is outside {min_images}--{max_images}"
         )
-        if unsupported:
-            issues.append(
-                _error(
-                    "metadata_conflict",
-                    "task.semantics",
-                    renderer.task_text(annotation),
-                    "Prompt contains concepts unsupported by task metadata: "
-                    + ", ".join(unsupported),
-                )
-            )
-
-    if not annotation.reference_candidates:
-        issues.append(
-            _error(
-                "reference_scope_error",
-                "reference_candidates",
-                "no usable first-frame crop",
-                "The Real first frame does not provide a reliable Reference crop.",
-            )
+    ids = [artifact.reference_id for artifact in selected]
+    if len(ids) != len(set(ids)):
+        raise ProductValidationError("selected Reference identities are not unique")
+    if not any(artifact.role == "primary" for artifact in selected):
+        raise ProductValidationError(
+            "selected References contain no primary task object"
         )
+    if any(artifact.source_frame_index != 0 for artifact in selected):
+        raise ProductValidationError("every Reference must originate from Real frame 0")
 
-    lowered_prompt = rendered_prompt.lower()
-    for phrase in sorted(TRAJECTORY_PHRASES):
-        if phrase in lowered_prompt:
-            issues.append(
-                _error(
-                    "prompt_content_error",
-                    "rendered_prompt",
-                    phrase,
-                    "Trajectory and action-phase detail must not enter Prompt.",
-                )
-            )
-
-    try:
-        renderer.validate_length(rendered_prompt)
-    except PromptLengthError as error:
-        issues.append(
-            _error(
-                "overdescription",
-                "rendered_prompt",
-                "rendered prompt",
-                str(error),
-            )
+    detected_queries = {item.query.casefold() for item in result.candidate_pool}
+    missing = sorted(
+        query.query
+        for query in queries
+        if query.required and query.query.casefold() not in detected_queries
+    )
+    if missing:
+        raise ProductValidationError(
+            "YOLOE did not detect required task entities: " + ", ".join(missing)
         )
-
-    return ValidationResult(issues=issues)
-
-
-def canonicalize_annotation(
-    annotation: StructuredAnnotation,
-) -> StructuredAnnotation:
-    """Return a normalized deep copy after schema validation."""
-
-    payload = annotation.model_dump()
-    payload["sample_id"] = clean_text(payload["sample_id"])
-    return StructuredAnnotation.model_validate(payload)
+    return result

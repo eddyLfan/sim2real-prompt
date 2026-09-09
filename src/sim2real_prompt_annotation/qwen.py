@@ -1,4 +1,4 @@
-"""Provider contract and Qwen OpenAI-compatible implementation."""
+"""Structured VLM provider used by the Real-only prompt branch."""
 
 from __future__ import annotations
 
@@ -7,6 +7,7 @@ import json
 import os
 import re
 from abc import ABC, abstractmethod
+from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Any
 
@@ -14,10 +15,12 @@ from openai import OpenAI
 from pydantic import BaseModel, ValidationError
 
 from .config import ProviderConfig
-from .media import PreparedMedia
+from .models import RealFrame
 
 
 class ResponseParseError(ValueError):
+    """The provider returned content that does not satisfy the requested schema."""
+
     def __init__(self, message: str, raw_text: str):
         super().__init__(message)
         self.raw_text = raw_text
@@ -34,6 +37,8 @@ class VLMResponse:
 
 
 class VLMClient(ABC):
+    """A cache/retry wrapper may implement this same one-request interface."""
+
     @abstractmethod
     def generate(
         self,
@@ -42,12 +47,12 @@ class VLMClient(ABC):
         stage: str,
         system_prompt: str,
         user_text: str,
-        media: PreparedMedia,
+        images: Sequence[RealFrame],
         response_model: type[BaseModel],
         temperature: float,
         max_tokens: int,
     ) -> VLMResponse:
-        """Generate and validate one structured response."""
+        """Make one provider request and validate one structured response."""
 
 
 def response_schema_instruction(response_model: type[BaseModel]) -> str:
@@ -59,8 +64,8 @@ def response_schema_instruction(response_model: type[BaseModel]) -> str:
     )
 
 
-def _data_url(mime: str, payload: bytes) -> str:
-    return f"data:{mime};base64,{base64.b64encode(payload).decode('ascii')}"
+def _data_url(payload: bytes) -> str:
+    return f"data:image/jpeg;base64,{base64.b64encode(payload).decode('ascii')}"
 
 
 def _json_text(raw: str) -> str:
@@ -70,6 +75,8 @@ def _json_text(raw: str) -> str:
 
 
 class QwenOpenAIClient(VLMClient):
+    """OpenAI-compatible Qwen client with no hidden retry or media discovery."""
+
     def __init__(self, config: ProviderConfig):
         api_key = os.getenv(config.api_key_env)
         if not api_key:
@@ -82,82 +89,32 @@ class QwenOpenAIClient(VLMClient):
             api_key=api_key,
             base_url=config.resolved_base_url(),
             timeout=config.timeout_seconds,
+            # Retries are deliberately owned by the pipeline/service layer so a
+            # prompt result is cached and retried as one logical operation.
             max_retries=0,
         )
 
-    def _content(self, user_text: str, media: PreparedMedia) -> list[dict[str, Any]]:
+    @staticmethod
+    def _content(user_text: str, images: Sequence[RealFrame]) -> list[dict[str, Any]]:
+        """Build an ordered Real-frame payload without Sim or native-video inputs."""
+
         content: list[dict[str, Any]] = [{"type": "text", "text": user_text}]
-        for group in media.groups:
-            role = "SIM VIDEO" if group.source == "sim" else "REAL VIDEO"
-            if group.native_path is not None:
-                evidence = f"{group.source}:{group.view}:native_video"
-                content.append(
-                    {
-                        "type": "text",
-                        "text": f"{role}; view={group.view}; evidence_id={evidence}",
-                    }
-                )
-                payload = group.native_path.read_bytes()
-                content.append(
-                    {
-                        "type": "video_url",
-                        "video_url": {"url": _data_url("video/mp4", payload)},
-                        "fps": group.sampling_fps,
-                    }
-                )
-            else:
-                frame_labels = ", ".join(
-                    f"{frame.evidence_id}@{frame.timestamp_seconds:.3f}s"
-                    for frame in group.frames
-                )
-                content.append(
-                    {
-                        "type": "text",
-                        "text": (
-                            f"{role}; view={group.view}; "
-                            f"ordered_frames=[{frame_labels}]"
-                        ),
-                    }
-                )
-                if len(group.frames) >= 4:
-                    content.append(
-                        {
-                            "type": "video",
-                            "video": [
-                                _data_url("image/jpeg", frame.jpeg)
-                                for frame in group.frames
-                            ],
-                            "fps": group.sampling_fps,
-                        }
-                    )
-                else:
-                    # Qwen's video modality rejects sequences shorter than four
-                    # images. Preserve short episodes as ordered image inputs.
-                    content.extend(
-                        {
-                            "type": "image_url",
-                            "image_url": {"url": _data_url("image/jpeg", frame.jpeg)},
-                        }
-                        for frame in group.frames
-                    )
-        if media.reference is not None:
-            content.extend(
-                [
-                    {
-                        "type": "text",
-                        "text": (
-                            "REFERENCE SOURCE IMAGE (REAL FIRST FRAME); "
-                            f"view={media.reference.view}; "
-                            f"evidence_id={media.reference.evidence_id}"
-                        ),
-                    },
-                    {
-                        "type": "image_url",
-                        "image_url": {
-                            "url": _data_url("image/jpeg", media.reference.jpeg)
-                        },
-                    },
-                ]
+        for position, image in enumerate(images):
+            content.append(
+                {
+                    "type": "text",
+                    "text": (
+                        f"REAL FRAME {position + 1}/{len(images)}: "
+                        f"source_index={image.frame_index}, "
+                        f"time={image.timestamp_seconds:.3f}s"
+                    ),
+                }
+            )
+            content.append(
+                {
+                    "type": "image_url",
+                    "image_url": {"url": _data_url(image.jpeg)},
+                }
             )
         return content
 
@@ -183,11 +140,15 @@ class QwenOpenAIClient(VLMClient):
         stage: str,
         system_prompt: str,
         user_text: str,
-        media: PreparedMedia,
+        images: Sequence[RealFrame],
         response_model: type[BaseModel],
         temperature: float,
         max_tokens: int,
     ) -> VLMResponse:
+        del sample_id  # Correlation is kept by the caller, not sent to the model.
+        if not images:
+            raise ValueError("At least one Real frame is required")
+
         schema_text = response_schema_instruction(response_model)
         completion = self.client.chat.completions.create(
             model=self.config.model,
@@ -195,7 +156,7 @@ class QwenOpenAIClient(VLMClient):
                 {"role": "system", "content": system_prompt},
                 {
                     "role": "user",
-                    "content": self._content(f"{user_text}\n\n{schema_text}", media),
+                    "content": self._content(f"{user_text}\n\n{schema_text}", images),
                 },
             ],
             temperature=temperature,
@@ -212,6 +173,7 @@ class QwenOpenAIClient(VLMClient):
             raise ResponseParseError(
                 f"{stage} returned invalid structured JSON: {error}", raw
             ) from error
+
         usage = completion.usage
         return VLMResponse(
             payload=payload,

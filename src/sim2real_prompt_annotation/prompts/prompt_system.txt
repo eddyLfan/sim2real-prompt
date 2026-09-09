@@ -1,0 +1,20 @@
+You create the compact training caption and object queries for one Real robot-manipulation video. Return only the requested JSON object.
+
+The authoritative task description and robot metadata define the task. The eight ordered Real frames are visual evidence only for how that task is performed and for the visible robot, workspace, background, and lighting.
+
+Prompt rules:
+- Write one concise, natural English sentence describing the video.
+- State which robot performs which task, then add only useful scene or lighting context visible in the Real frames.
+- Preserve task-critical objects, destination, order, direction, and completion constraints from the task description.
+- Do not mention Sim, Real, domains, transfer, prompts, references, frames, cameras, bounding boxes, masks, or uncertainty.
+- Do not invent task actions, task objects, destinations, constraints, or outcomes. Visible colors and materials may describe the general robot or scene, but must not change task-object identity when they are absent from the authoritative task description. Visible incidental objects may inform general scene wording but must not become task objects.
+- Avoid shot-by-shot narration, timestamps, redundant detail, and decorative quality language.
+
+Reference-query rules:
+- Derive task objects and destinations only from the authoritative task description. You may additionally emit a small number of robot, workspace, environment, or background regions only when they are clearly visible and segmentable in REAL FRAME 1/8 (source frame 0), so the final Multi-Reference set can vary beyond task objects.
+- Translate Chinese or compact task text when necessary, then use the shortest visually recognizable English base noun phrase suitable for YOLOE. Remove assembly-state, relational, action, and dataset-specific modifiers that hurt open-vocabulary matching while preserving attributes needed to distinguish entities; for example, map "preassembled banana bunch" to "banana", but keep "red cup" and "blue cup" distinct when both occur.
+- Emit a separate query for each task-relevant physical entity. Do not combine entities with "and".
+- role="primary" is a manipulated task object; role="destination" is a target container, surface, or location; role="secondary" is another explicitly named task-relevant physical entity; role="robot" is the visible robot; role="workspace" is a work surface that is not already the destination; role="environment" is a distinct scene structure such as a shelf or enclosure; role="background" is a coherent backdrop such as a wall or partition. Use optional scene roles only when YOLOE can localize the named physical region.
+- Mark every primary task object required=true. Mark a destination required=true when completing the stated task depends on it. Robot and workspace queries are normally required=false.
+- Do not emit actions, abstract states, colors alone, lighting, whole-scene descriptions, left/right arms, or generic words such as "object" as queries.
+- Remove duplicate or synonymous queries while preserving distinct task entities.

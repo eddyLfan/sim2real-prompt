@@ -1,214 +1,110 @@
-"""Thin command-line wrapper around the public pipeline interface."""
+"""Command-line interface for the two-branch preprocessing pipeline."""
 
 from __future__ import annotations
 
 import argparse
 import json
-import os
 import sys
 from pathlib import Path
 from typing import Any
 
-from .api import PromptAnnotationPipeline
-from .processing import DatasetProcessingPipeline
-
-
-def _pipeline(args: argparse.Namespace) -> PromptAnnotationPipeline:
-    return PromptAnnotationPipeline(
-        args.config,
-        dataset_root=getattr(args, "dataset_root", None),
-        output_root=getattr(args, "output_root", None),
-    )
-
-
-def _selection(args: argparse.Namespace) -> dict[str, Any]:
-    return {
-        "dataset_glob": args.dataset_glob,
-        "episodes": args.episodes,
-        "limit": args.limit,
-    }
+from .api import Sim2RealPreprocessingPipeline
 
 
 def _print_json(value: Any) -> None:
     print(json.dumps(value, ensure_ascii=False, indent=2))
 
 
-def command_inspect(args: argparse.Namespace) -> int:
+def _pipeline(args: argparse.Namespace) -> Sim2RealPreprocessingPipeline:
+    return Sim2RealPreprocessingPipeline(
+        args.config,
+        dataset_root=args.dataset,
+        output_root=args.output,
+        dataset_glob=args.dataset_glob,
+    )
+
+
+def _selection(args: argparse.Namespace) -> dict[str, Any]:
+    return {"episodes": args.episodes, "limit": args.limit}
+
+
+def _inspect(args: argparse.Namespace) -> int:
     _print_json(_pipeline(args).inspect(**_selection(args), show=args.show))
     return 0
 
 
-def command_run(args: argparse.Namespace) -> int:
-    try:
-        result = _pipeline(args).run(
-            **_selection(args),
-            force=args.force,
-            dry_run=args.dry_run,
-            prepare_media=args.prepare_media,
-            show=args.show,
-        )
-    except ValueError as error:
-        print(str(error), file=sys.stderr)
-        return 2
-    _print_json(result)
-    return 1 if result.get("failed", 0) else 0
-
-
-def command_references(args: argparse.Namespace) -> int:
-    result = _pipeline(args).export_references(
-        **_selection(args),
-        directory_name=args.directory_name,
-        overwrite=args.overwrite,
-        full_resolution=not args.resized,
-        jpeg_quality=args.jpeg_quality,
-    )
-    _print_json(result)
-    return 0
-
-
-def command_audit(args: argparse.Namespace) -> int:
-    result = _pipeline(args).audit(**_selection(args), show=args.show)
-    _print_json(result)
-    return 1 if result["incomplete"] else 0
-
-
-def command_render(args: argparse.Namespace) -> int:
-    text = _pipeline(args).render(args.annotation)
-    if args.output:
-        destination = Path(args.output)
-        destination.parent.mkdir(parents=True, exist_ok=True)
-        destination.write_text(text + "\n", encoding="utf-8")
-    else:
-        print(text)
-    return 0
-
-
-def command_schema(args: argparse.Namespace) -> int:
-    del args
-    _print_json(PromptAnnotationPipeline.schemas())
-    return 0
-
-
-def command_process(args: argparse.Namespace) -> int:
-    report = DatasetProcessingPipeline(
-        args.dataset,
-        config=args.config,
-        output_root=args.output_root,
-    ).run(
-        check_only=args.check_only,
-        force=args.force,
-        probe_videos=not args.skip_video_probe,
+def _run(args: argparse.Namespace) -> int:
+    report = _pipeline(args).run(
+        **_selection(args), force=args.force, audit=not args.no_audit
     )
     _print_json(report)
-    return {"complete": 0, "needs_processing": 1, "blocked": 2}[report["status"]]
+    return 0 if report["status"] == "complete" else 1
 
 
-def _add_config(parser: argparse.ArgumentParser) -> None:
-    parser.add_argument("--config", help="Optional path to YAML configuration")
-    parser.add_argument("--dataset-root", help="Override the configured dataset root")
-    parser.add_argument("--output-root", help="Override the configured output root")
+def _audit(args: argparse.Namespace) -> int:
+    report = _pipeline(args).audit(**_selection(args), show=args.show)
+    _print_json(report)
+    return 0 if report["status"] == "complete" else 1
 
 
-def _add_selection(parser: argparse.ArgumentParser) -> None:
+def _add_common(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--config", type=Path, help="YAML configuration path")
+    parser.add_argument(
+        "--dataset",
+        type=Path,
+        help="Dataset root override (a dataset or directory of datasets)",
+    )
+    parser.add_argument("--output", type=Path, help="Checkpoint/report root override")
     parser.add_argument(
         "--dataset-glob",
-        default=os.environ.get("SIM2REAL_PROMPT_DATASET_GLOBS", "*"),
-        help="Dataset directory glob or comma-separated globs",
+        help="Child dataset glob override; ignored when --dataset is a dataset root",
     )
-    parser.add_argument("--episodes", help="Episode ids/ranges, e.g. 0,2,5-9")
-    parser.add_argument("--limit", type=int, help="Global sample limit")
+    parser.add_argument("--episodes", help="Episode selection, e.g. 0,2,5-9")
+    parser.add_argument("--limit", type=int, help="Maximum number of episodes")
 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="sim2real-prompt",
-        description="Project-specific compact prompts for paired LeRobot datasets",
+        description=(
+            "Create Real-video prompts and YOLOE-S Seg Multi-References for Transfer"
+        ),
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
 
-    process_parser = subparsers.add_parser(
-        "process", help="Validate and build all Multi-Reference/Prompt dataset outputs"
-    )
-    process_parser.add_argument(
-        "--dataset", required=True, help="Paired LeRobot dataset root"
-    )
-    process_parser.add_argument("--config", help="Optional path to YAML configuration")
-    process_parser.add_argument(
-        "--output-root", help="External annotations/reports directory"
-    )
-    process_parser.add_argument("--check-only", action="store_true")
-    process_parser.add_argument("--force", action="store_true")
-    process_parser.add_argument("--skip-video-probe", action="store_true")
-    process_parser.set_defaults(handler=command_process)
-
     inspect_parser = subparsers.add_parser(
-        "inspect", help="Inspect bounded paired LeRobot metadata discovery"
+        "inspect", help="Validate metadata and list work without decoding video"
     )
-    _add_config(inspect_parser)
-    _add_selection(inspect_parser)
+    _add_common(inspect_parser)
     inspect_parser.add_argument("--show", type=int, default=3)
-    inspect_parser.set_defaults(handler=command_inspect)
+    inspect_parser.set_defaults(handler=_inspect)
 
-    run_parser = subparsers.add_parser("run", help="Run the linear batch pipeline")
-    _add_config(run_parser)
-    _add_selection(run_parser)
+    run_parser = subparsers.add_parser("run", help="Run both branches and publish")
+    _add_common(run_parser)
     run_parser.add_argument(
-        "--force", action="store_true", help="Regenerate completed samples"
-    )
-    run_parser.add_argument(
-        "--dry-run", action="store_true", help="Do not create a VLM client"
+        "--force", action="store_true", help="Ignore valid branch checkpoints"
     )
     run_parser.add_argument(
-        "--prepare-media",
-        action="store_true",
-        help="In dry-run mode, decode selected media for every matched sample",
+        "--no-audit", action="store_true", help="Skip the final product audit"
     )
-    run_parser.add_argument("--show", type=int, default=3)
-    run_parser.set_defaults(handler=command_run)
-
-    reference_parser = subparsers.add_parser(
-        "references", help="Rebuild first-frame semantic Multi-Reference crops"
-    )
-    _add_config(reference_parser)
-    _add_selection(reference_parser)
-    reference_parser.add_argument("--directory-name", default="Reference")
-    reference_parser.add_argument("--jpeg-quality", type=int, default=95)
-    reference_parser.add_argument(
-        "--overwrite", action="store_true", help="Replace conflicting images"
-    )
-    reference_parser.add_argument(
-        "--resized",
-        action="store_true",
-        help="Export the resized prompt representation instead of full resolution",
-    )
-    reference_parser.set_defaults(handler=command_references)
+    run_parser.set_defaults(handler=_run)
 
     audit_parser = subparsers.add_parser(
-        "audit", help="Audit current outputs without API access"
+        "audit", help="Check published products without API or model access"
     )
-    _add_config(audit_parser)
-    _add_selection(audit_parser)
-    audit_parser.add_argument("--show", type=int, default=10)
-    audit_parser.set_defaults(handler=command_audit)
-
-    render_parser = subparsers.add_parser(
-        "render", help="Deterministically render an existing canonical annotation"
-    )
-    _add_config(render_parser)
-    render_parser.add_argument("--annotation", required=True)
-    render_parser.add_argument("--output")
-    render_parser.set_defaults(handler=command_render)
-
-    schema_parser = subparsers.add_parser(
-        "schema", help="Print the annotation JSON Schema"
-    )
-    schema_parser.set_defaults(handler=command_schema)
+    _add_common(audit_parser)
+    audit_parser.add_argument("--show", type=int, default=20)
+    audit_parser.set_defaults(handler=_audit)
     return parser
 
 
 def main(argv: list[str] | None = None) -> int:
-    args = build_parser().parse_args(argv)
-    return int(args.handler(args))
+    try:
+        args = build_parser().parse_args(argv)
+        return int(args.handler(args))
+    except (FileNotFoundError, OSError, TypeError, ValueError) as error:
+        print(f"error: {error}", file=sys.stderr)
+        return 2
 
 
 if __name__ == "__main__":

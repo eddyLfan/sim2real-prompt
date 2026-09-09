@@ -1,7 +1,11 @@
-"""Project-specific compact Prompt annotation for paired LeRobot data."""
+"""Real-video Prompt and Multi-Reference preprocessing for Transfer."""
 
-from .api import PromptAnnotationPipeline
-from .dataset_validation import inspect_dataset
-from .processing import DatasetProcessingPipeline
+from .api import PromptAnnotationPipeline, Sim2RealPreprocessingPipeline
+from .config import PipelineConfig, load_config
 
-__all__ = ["DatasetProcessingPipeline", "PromptAnnotationPipeline", "inspect_dataset"]
+__all__ = [
+    "PipelineConfig",
+    "PromptAnnotationPipeline",
+    "Sim2RealPreprocessingPipeline",
+    "load_config",
+]
