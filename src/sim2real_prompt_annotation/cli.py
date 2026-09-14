@@ -21,6 +21,10 @@ def _pipeline(args: argparse.Namespace) -> Sim2RealPreprocessingPipeline:
         dataset_root=args.dataset,
         output_root=args.output,
         dataset_glob=args.dataset_glob,
+        reference_device=args.reference_device,
+        reference_batch_size=args.reference_batch_size,
+        api_concurrency=args.api_concurrency,
+        decode_workers=args.decode_workers,
     )
 
 
@@ -61,13 +65,22 @@ def _add_common(parser: argparse.ArgumentParser) -> None:
     )
     parser.add_argument("--episodes", help="Episode selection, e.g. 0,2,5-9")
     parser.add_argument("--limit", type=int, help="Maximum number of episodes")
+    parser.add_argument("--reference-device", help="Reference device override")
+    parser.add_argument(
+        "--reference-batch-size", type=int, help="Pipeline micro-batch override"
+    )
+    parser.add_argument(
+        "--api-concurrency", type=int, help="Prompt API concurrency override"
+    )
+    parser.add_argument("--decode-workers", type=int, help="Decode worker override")
 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="sim2real-prompt",
         description=(
-            "Create Real-video prompts and YOLOE-S Seg Multi-References for Transfer"
+            "Create Real-video prompts and one robot-removed scene Reference for "
+            "Transfer"
         ),
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -79,7 +92,9 @@ def build_parser() -> argparse.ArgumentParser:
     inspect_parser.add_argument("--show", type=int, default=3)
     inspect_parser.set_defaults(handler=_inspect)
 
-    run_parser = subparsers.add_parser("run", help="Run both branches and publish")
+    run_parser = subparsers.add_parser(
+        "run", help="Run the independent Prompt and clean-scene Reference branches"
+    )
     _add_common(run_parser)
     run_parser.add_argument(
         "--force", action="store_true", help="Ignore valid branch checkpoints"

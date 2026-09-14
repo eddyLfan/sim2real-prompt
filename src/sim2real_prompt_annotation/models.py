@@ -1,4 +1,4 @@
-"""Small, serializable contracts shared by the two preprocessing branches."""
+"""Serializable contracts shared by the prompt and scene-Reference branches."""
 
 from __future__ import annotations
 
@@ -7,21 +7,13 @@ import re
 from pathlib import Path
 from typing import Any, Literal
 
+import cv2
 import numpy as np
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
-from .config import MAX_REFERENCE_IMAGES, PROMPT_FRAME_COUNT
+from .config import PROMPT_FRAME_COUNT, REFERENCE_IMAGE_COUNT
 
 Split = Literal["train", "validation"]
-ReferenceRole = Literal[
-    "primary",
-    "destination",
-    "secondary",
-    "robot",
-    "workspace",
-    "environment",
-    "background",
-]
 
 
 def clean_text(value: str) -> str:
@@ -35,35 +27,10 @@ class StrictModel(BaseModel):
     model_config = ConfigDict(extra="forbid", validate_assignment=True)
 
 
-class ReferenceQuery(StrictModel):
-    """One short English detector prompt returned by the prompt VLM call."""
-
-    query: str = Field(min_length=1, max_length=120)
-    role: ReferenceRole
-    required: bool = False
-
-    @field_validator("query")
-    @classmethod
-    def normalize_query(cls, value: str) -> str:
-        value = clean_text(value).strip(" .;:,!")
-        if not value:
-            raise ValueError("reference query must be non-empty")
-        return value
-
-    @property
-    def primary(self) -> bool:
-        return self.role == "primary"
-
-
-# A migration-friendly synonym used in design documents and detector code.
-ObjectQuery = ReferenceQuery
-
-
 class PromptPayload(StrictModel):
-    """The complete useful content of one VLM response."""
+    """The complete useful content of the single VLM response."""
 
     prompt: str = Field(min_length=1, max_length=800)
-    reference_queries: list[ReferenceQuery] = Field(min_length=1, max_length=8)
 
     @field_validator("prompt")
     @classmethod
@@ -72,20 +39,6 @@ class PromptPayload(StrictModel):
         if not value:
             raise ValueError("prompt must be non-empty")
         return value
-
-    @field_validator("reference_queries")
-    @classmethod
-    def unique_queries(cls, values: list[ReferenceQuery]) -> list[ReferenceQuery]:
-        seen: set[tuple[str, ReferenceRole]] = set()
-        result: list[ReferenceQuery] = []
-        for value in values:
-            key = (value.query.casefold(), value.role)
-            if key not in seen:
-                seen.add(key)
-                result.append(value)
-        if not result:
-            raise ValueError("at least one unique reference query is required")
-        return result
 
 
 class RealFrame(StrictModel):
@@ -96,8 +49,20 @@ class RealFrame(StrictModel):
     jpeg: bytes = Field(min_length=1)
 
 
+def _valid_bgr(value: Any, *, name: str) -> np.ndarray:
+    if (
+        not isinstance(value, np.ndarray)
+        or value.ndim != 3
+        or value.shape[2] != 3
+        or value.size == 0
+        or value.dtype != np.uint8
+    ):
+        raise ValueError(f"{name} must be a non-empty uint8 HxWx3 array")
+    return value
+
+
 class RealFrameBundle(StrictModel):
-    """One-pass decode output shared by Prompt and Reference workers."""
+    """One-open decode output: eight Prompt JPEGs and the original Real frame zero."""
 
     sample_id: str = Field(min_length=1)
     view: str = Field(min_length=1)
@@ -120,15 +85,7 @@ class RealFrameBundle(StrictModel):
     @field_validator("first_frame_bgr")
     @classmethod
     def valid_first_frame(cls, value: Any) -> np.ndarray:
-        if (
-            not isinstance(value, np.ndarray)
-            or value.ndim != 3
-            or value.shape[2] != 3
-            or value.size == 0
-            or value.dtype != np.uint8
-        ):
-            raise ValueError("first_frame_bgr must be a non-empty uint8 HxWx3 array")
-        return value
+        return _valid_bgr(value, name="first_frame_bgr")
 
     @model_validator(mode="after")
     def valid_prompt_sequence(self) -> RealFrameBundle:
@@ -143,6 +100,8 @@ class RealFrameBundle(StrictModel):
             raise ValueError("prompt frame sequence must include Real frame zero")
         if indices[-1] >= self.frame_count:
             raise ValueError("prompt frame index exceeds decoded video length")
+        if self.first_frame_bgr.shape[:2] != (self.height, self.width):
+            raise ValueError("first_frame_bgr dimensions do not match bundle metadata")
         return self
 
     @property
@@ -166,6 +125,8 @@ class EpisodeRecord(StrictModel):
     task: str = Field(min_length=1)
     subtasks: tuple[dict[str, Any], ...] = ()
     real_view: str = Field(min_length=1)
+    real_frame_height: int = Field(ge=1)
+    real_frame_width: int = Field(ge=1)
     real_video: Path
     metadata: dict[str, Any] = Field(default_factory=dict)
 
@@ -200,6 +161,8 @@ class EpisodeRecord(StrictModel):
             "robot_type": self.robot_type,
             "task": self.task,
             "real_view": self.real_view,
+            "real_frame_height": self.real_frame_height,
+            "real_frame_width": self.real_frame_width,
             "subtasks": list(self.subtasks),
         }
 
@@ -207,7 +170,6 @@ class EpisodeRecord(StrictModel):
 class PromptResult(StrictModel):
     sample_id: str = Field(min_length=1)
     prompt: str = Field(min_length=1, max_length=800)
-    reference_queries: tuple[ReferenceQuery, ...] = Field(min_length=1, max_length=8)
     model: str = Field(min_length=1)
     request_id: str | None = None
     input_tokens: int | None = Field(default=None, ge=0)
@@ -235,50 +197,85 @@ class PromptResult(StrictModel):
         return values
 
 
-class Detection(StrictModel):
-    """Serializable YOLOE result in full-resolution first-frame coordinates."""
+class RobotMaskPrediction(StrictModel):
+    """One full-resolution binary robot mask produced by a segmenter."""
 
-    query: str = Field(min_length=1, max_length=120)
-    role: ReferenceRole
-    required: bool = False
-    confidence: float = Field(ge=0.0, le=1.0)
-    bbox_xyxy: tuple[float, float, float, float]
+    backend: str = Field(min_length=1)
+    query: str = Field(default="robot", min_length=1, max_length=120)
+    confidence: float | None = Field(default=None, ge=0.0, le=1.0)
+    bbox_xyxy: tuple[int, int, int, int]
     image_width: int = Field(ge=1)
     image_height: int = Field(ge=1)
-    mask_polygon: tuple[tuple[float, float], ...] | None = None
+    mask: Any
 
-    @field_validator("query")
+    @field_validator("backend", "query")
     @classmethod
-    def normalize_query(cls, value: str) -> str:
-        value = clean_text(value).strip(" .;:,!")
+    def normalize_text(cls, value: str) -> str:
+        value = clean_text(value).strip(" ,.;:")
         if not value:
-            raise ValueError("detection query must be non-empty")
+            raise ValueError("robot mask text must be non-empty")
         return value
 
+    @field_validator("mask")
+    @classmethod
+    def valid_binary_mask(cls, value: Any) -> np.ndarray:
+        if not isinstance(value, np.ndarray) or value.ndim != 2 or value.size == 0:
+            raise ValueError("robot mask must be a non-empty HxW numpy array")
+        if value.dtype not in (np.dtype(bool), np.dtype(np.uint8)):
+            raise ValueError("robot mask must have bool or uint8 dtype")
+        values = np.unique(value)
+        if not set(int(item) for item in values).issubset({0, 1, 255}):
+            raise ValueError("robot mask must be binary")
+        return np.ascontiguousarray(value > 0, dtype=np.uint8)
+
     @model_validator(mode="after")
-    def valid_geometry(self) -> Detection:
+    def valid_geometry(self) -> RobotMaskPrediction:
+        if self.mask.shape != (self.image_height, self.image_width):
+            raise ValueError("robot mask dimensions do not match the source image")
         x1, y1, x2, y2 = self.bbox_xyxy
-        if x2 <= x1 or y2 <= y1:
-            raise ValueError("bbox_xyxy must have positive width and height")
-        if x1 < 0 or y1 < 0 or x2 > self.image_width or y2 > self.image_height:
-            raise ValueError("bbox_xyxy must lie inside the source image")
-        if self.mask_polygon is not None:
-            if len(self.mask_polygon) < 3:
-                raise ValueError("mask_polygon must contain at least three points")
-            if any(
-                x < 0 or y < 0 or x > self.image_width or y > self.image_height
-                for x, y in self.mask_polygon
-            ):
-                raise ValueError("mask_polygon must lie inside the source image")
+        if not (0 <= x1 < x2 <= self.image_width and 0 <= y1 < y2 <= self.image_height):
+            raise ValueError("robot mask bbox must lie inside the source image")
+        if not np.any(self.mask):
+            raise ValueError("robot mask must contain foreground pixels")
+        ys, xs = np.nonzero(self.mask)
+        actual = (int(xs.min()), int(ys.min()), int(xs.max()) + 1, int(ys.max()) + 1)
+        if actual != self.bbox_xyxy:
+            raise ValueError("robot mask bbox must be the tight mask boundary")
         return self
 
     @property
-    def primary(self) -> bool:
-        return self.role == "primary"
+    def mask_sha256(self) -> str:
+        return hashlib.sha256(self.mask.tobytes(order="C")).hexdigest()
+
+    @property
+    def mask_area_fraction(self) -> float:
+        return float(np.count_nonzero(self.mask)) / float(self.mask.size)
 
 
-class ReferenceArtifact(StrictModel):
-    """One selected JPEG plus all fields needed for schema-v2 publication."""
+class RobotMaskDiagnostic(StrictModel):
+    """Compact, JSON-safe mask evidence retained in the branch checkpoint."""
+
+    backend: str = Field(min_length=1)
+    query: str = Field(min_length=1)
+    confidence: float | None = Field(default=None, ge=0.0, le=1.0)
+    bbox_xyxy: tuple[int, int, int, int]
+    mask_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    mask_area_fraction: float = Field(gt=0.0, le=1.0)
+
+    @classmethod
+    def from_prediction(cls, value: RobotMaskPrediction) -> RobotMaskDiagnostic:
+        return cls(
+            backend=value.backend,
+            query=value.query,
+            confidence=value.confidence,
+            bbox_xyxy=value.bbox_xyxy,
+            mask_sha256=value.mask_sha256,
+            mask_area_fraction=value.mask_area_fraction,
+        )
+
+
+class SceneReferenceArtifact(StrictModel):
+    """The sole full-scene JPEG created by robot removal and inpainting."""
 
     sample_id: str = Field(min_length=1)
     reference_id: str = Field(pattern=r"^sha256:[0-9a-f]{64}$")
@@ -286,29 +283,23 @@ class ReferenceArtifact(StrictModel):
     jpeg: bytes = Field(min_length=1)
     source_view: str = Field(min_length=1)
     source_frame_index: Literal[0] = 0
-    query: str = Field(min_length=1, max_length=120)
-    role: ReferenceRole
-    confidence: float = Field(ge=0.0, le=1.0)
-    bbox_xyxy: tuple[float, float, float, float]
-    crop_xyxy: tuple[int, int, int, int]
+    scope: Literal["environment"] = "environment"
+    reference_kind: Literal["robot_removed_scene"] = "robot_removed_scene"
+    width: int = Field(ge=1)
+    height: int = Field(ge=1)
+    source_frame_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    mask_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    mask_area_fraction: float = Field(gt=0.0, lt=1.0)
     sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
-    description: str | None = None
     provenance: dict[str, Any] = Field(default_factory=dict)
 
-    @field_validator("sample_id", "source_view", "query")
+    @field_validator("sample_id", "source_view")
     @classmethod
     def normalize_required_text(cls, value: str) -> str:
-        value = clean_text(value).strip(" .;:,!")
+        value = clean_text(value)
         if not value:
             raise ValueError("artifact text must be non-empty")
         return value
-
-    @field_validator("description")
-    @classmethod
-    def normalize_description(cls, value: str | None) -> str | None:
-        if value is None:
-            return None
-        return clean_text(value) or None
 
     @field_validator("relative_path")
     @classmethod
@@ -318,71 +309,90 @@ class ReferenceArtifact(StrictModel):
         return value
 
     @model_validator(mode="after")
-    def valid_artifact(self) -> ReferenceArtifact:
+    def valid_artifact(self) -> SceneReferenceArtifact:
         digest = hashlib.sha256(self.jpeg).hexdigest()
         if self.sha256 != digest or self.reference_id != f"sha256:{digest}":
             raise ValueError("reference_id and sha256 must identify the JPEG bytes")
-        x1, y1, x2, y2 = self.crop_xyxy
-        if min(x1, y1) < 0 or x2 <= x1 or y2 <= y1:
-            raise ValueError("crop_xyxy must have valid non-negative pixel bounds")
         return self
 
     @property
-    def primary(self) -> bool:
-        return self.role == "primary"
-
-    @property
     def row(self) -> dict[str, Any]:
-        scope = (
-            self.role
-            if self.role in {"robot", "workspace", "environment", "background"}
-            else "objects"
-        )
-        row: dict[str, Any] = {
+        return {
             "reference_id": self.reference_id,
             "reference_path": self.relative_path.as_posix(),
             "source_view": self.source_view,
             "source_frame_index": self.source_frame_index,
-            "query": self.query,
-            "label": self.query,
-            "role": self.role,
-            "scope": scope,
-            "confidence": self.confidence,
-            "bbox_xyxy": list(self.bbox_xyxy),
-            "crop_xyxy": list(self.crop_xyxy),
+            "scope": self.scope,
+            "reference_kind": self.reference_kind,
+            "width": self.width,
+            "height": self.height,
+            "source_frame_sha256": self.source_frame_sha256,
+            "mask_sha256": self.mask_sha256,
+            "mask_area_fraction": self.mask_area_fraction,
             "sha256": self.sha256,
+            "provenance": self.provenance,
         }
-        if self.description is not None:
-            row["description"] = self.description
-        if self.provenance:
-            row["provenance"] = self.provenance
-        return row
 
 
-class ReferenceBranchResult(StrictModel):
+class SceneReferenceResult(StrictModel):
     sample_id: str = Field(min_length=1)
-    candidate_pool: tuple[Detection, ...]
-    selected_artifacts: tuple[ReferenceArtifact, ...] = Field(
-        min_length=1, max_length=MAX_REFERENCE_IMAGES
-    )
+    artifact: SceneReferenceArtifact
+    robot_masks: tuple[RobotMaskDiagnostic, ...] = Field(min_length=1)
+    removal_mask_png: bytes = Field(min_length=1)
     rejected_reasons: tuple[str, ...] = ()
     input_fingerprint: str = Field(min_length=1)
 
     @model_validator(mode="after")
-    def consistent_sample(self) -> ReferenceBranchResult:
-        if any(
-            artifact.sample_id != self.sample_id for artifact in self.selected_artifacts
+    def consistent_sample(self) -> SceneReferenceResult:
+        if self.artifact.sample_id != self.sample_id:
+            raise ValueError("scene Reference artifact must belong to sample_id")
+        decoded = cv2.imdecode(
+            np.frombuffer(self.removal_mask_png, dtype=np.uint8),
+            cv2.IMREAD_GRAYSCALE,
+        )
+        if decoded is None or decoded.shape != (
+            self.artifact.height,
+            self.artifact.width,
         ):
-            raise ValueError("every selected artifact must belong to sample_id")
+            raise ValueError(
+                "removal_mask_png must decode at the scene Reference dimensions"
+            )
+        values = set(int(item) for item in np.unique(decoded))
+        if not values.issubset({0, 1, 255}) or not np.any(decoded):
+            raise ValueError("removal_mask_png must contain a non-empty binary mask")
+        binary = np.ascontiguousarray(decoded > 0, dtype=np.uint8)
+        mask_digest = hashlib.sha256(binary.tobytes(order="C")).hexdigest()
+        if mask_digest != self.artifact.mask_sha256:
+            raise ValueError(
+                "removal_mask_png pixels do not match artifact.mask_sha256"
+            )
+        area_fraction = float(np.count_nonzero(binary)) / float(binary.size)
+        if not np.isclose(area_fraction, self.artifact.mask_area_fraction):
+            raise ValueError(
+                "removal_mask_png area does not match artifact.mask_area_fraction"
+            )
         return self
+
+    @property
+    def selected_artifacts(self) -> tuple[SceneReferenceArtifact]:
+        """Compatibility view for publication code during the schema-v3 migration."""
+
+        return (self.artifact,)
+
+
+# Compatibility aliases for one migration cycle. New code should use the scene names.
+ReferenceArtifact = SceneReferenceArtifact
+ReferenceBranchResult = SceneReferenceResult
 
 
 class EpisodePromptRow(StrictModel):
-    """Stable Transfer training contract for ``episodes_prompt.jsonl``."""
+    """Stable Transfer contract for ``episodes_prompt.jsonl``."""
 
     episode_index: int = Field(ge=0)
     prompt: str = Field(min_length=1)
-    reference_ids: list[str] = Field(min_length=1, max_length=MAX_REFERENCE_IMAGES)
+    reference_ids: list[str] = Field(
+        min_length=REFERENCE_IMAGE_COUNT, max_length=REFERENCE_IMAGE_COUNT
+    )
 
     @field_validator("reference_ids")
     @classmethod
@@ -393,10 +403,10 @@ class EpisodePromptRow(StrictModel):
 
 
 class EpisodeReferenceRow(StrictModel):
-    """Stable schema-v2 contract for ``reference_images.jsonl``."""
+    """Schema-v3 exact-one scene contract for ``reference_images.jsonl``."""
 
-    schema_version: Literal[2] = 2
+    schema_version: Literal[3] = 3
     episode_index: int = Field(ge=0)
     references: list[dict[str, Any]] = Field(
-        min_length=1, max_length=MAX_REFERENCE_IMAGES
+        min_length=REFERENCE_IMAGE_COUNT, max_length=REFERENCE_IMAGE_COUNT
     )

@@ -1,11 +1,15 @@
-"""Pure validation for prompt and Reference branch products."""
+"""Pure validation for Prompt and robot-removed scene Reference products."""
 
 from __future__ import annotations
 
+import hashlib
+import math
 import re
-from collections.abc import Sequence
 
-from .models import PromptResult, ReferenceBranchResult, ReferenceQuery, clean_text
+import cv2
+import numpy as np
+
+from .models import PromptResult, SceneReferenceResult, clean_text
 
 _PROMPT_FORBIDDEN_PHRASES = (
     "reference image",
@@ -47,13 +51,6 @@ def validate_prompt_result(
         max_words=max_words,
         max_characters=max_characters,
     )
-    if not any(query.role == "primary" for query in result.reference_queries):
-        raise ProductValidationError("VLM returned no primary task-object query")
-    if any(
-        query.role == "primary" and not query.required
-        for query in result.reference_queries
-    ):
-        raise ProductValidationError("every primary task-object query must be required")
     return result.model_copy(update={"prompt": prompt})
 
 
@@ -91,38 +88,133 @@ def validate_prompt_text(
     return prompt
 
 
-def validate_reference_result(
-    result: ReferenceBranchResult,
-    queries: Sequence[ReferenceQuery],
-    *,
-    min_images: int = 1,
-    max_images: int = 3,
-) -> ReferenceBranchResult:
-    """Verify detection coverage and the selected 1--3 first-frame crops."""
+def validate_reference_result(result: SceneReferenceResult) -> SceneReferenceResult:
+    """Fail closed unless the branch produced one full-size frame-zero scene."""
 
-    selected = result.selected_artifacts
-    if not min_images <= len(selected) <= max_images:
+    artifact = result.artifact
+    if artifact.source_frame_index != 0:
+        raise ProductValidationError("scene Reference must come from Real frame zero")
+    if artifact.scope != "environment":
+        raise ProductValidationError("scene Reference scope must be 'environment'")
+    if artifact.reference_kind != "robot_removed_scene":
+        raise ProductValidationError("Reference kind must be 'robot_removed_scene'")
+    if not result.robot_masks:
+        raise ProductValidationError("scene Reference has no robot-mask evidence")
+    if not artifact.provenance:
+        raise ProductValidationError("scene Reference provenance must not be empty")
+    if artifact.provenance.get("operation") != "robot_removal_inpainting":
+        raise ProductValidationError("scene Reference provenance has wrong operation")
+    segmenter = artifact.provenance.get("segmenter")
+    if not isinstance(segmenter, dict) or not segmenter:
         raise ProductValidationError(
-            f"Reference count {len(selected)} is outside {min_images}--{max_images}"
+            "scene Reference provenance lacks segmenter identity"
         )
-    ids = [artifact.reference_id for artifact in selected]
-    if len(ids) != len(set(ids)):
-        raise ProductValidationError("selected Reference identities are not unique")
-    if not any(artifact.role == "primary" for artifact in selected):
+    inpainter = artifact.provenance.get("inpainter")
+    if not isinstance(inpainter, dict) or not inpainter:
         raise ProductValidationError(
-            "selected References contain no primary task object"
+            "scene Reference provenance lacks inpainter identity"
         )
-    if any(artifact.source_frame_index != 0 for artifact in selected):
-        raise ProductValidationError("every Reference must originate from Real frame 0")
+    final_mask = artifact.provenance.get("final_mask")
+    if not isinstance(final_mask, dict):
+        raise ProductValidationError("scene Reference provenance lacks final mask")
+    final_area = final_mask.get("area_fraction")
+    if (
+        final_mask.get("sha256") != artifact.mask_sha256
+        or isinstance(final_area, bool)
+        or not isinstance(final_area, (int, float))
+        or not math.isclose(final_area, artifact.mask_area_fraction)
+    ):
+        raise ProductValidationError(
+            "scene Reference final-mask provenance differs from artifact"
+        )
+    quality_control = artifact.provenance.get("quality_control")
+    if (
+        not isinstance(quality_control, dict)
+        or quality_control.get("outside_mask_unchanged") is not True
+    ):
+        raise ProductValidationError(
+            "scene Reference does not prove pixels outside the mask were preserved"
+        )
+    residual_qa = artifact.provenance.get("residual_qa")
+    if not isinstance(residual_qa, dict):
+        raise ProductValidationError("scene Reference provenance lacks residual QA")
+    expected_residual_fields = {
+        "enabled",
+        "detector",
+        "queries",
+        "area_fraction",
+        "threshold",
+        "pass",
+    }
+    if set(residual_qa) != expected_residual_fields:
+        raise ProductValidationError(
+            "scene Reference residual QA fields are incomplete or unexpected"
+        )
+    enabled = residual_qa.get("enabled")
+    detector = residual_qa.get("detector")
+    queries = residual_qa.get("queries")
+    residual_area = residual_qa.get("area_fraction")
+    residual_threshold = residual_qa.get("threshold")
+    residual_pass = residual_qa.get("pass")
+    if not isinstance(enabled, bool):
+        raise ProductValidationError("scene Reference residual QA enabled is invalid")
+    if (enabled and (not isinstance(detector, dict) or not detector)) or (
+        not enabled and detector is not None
+    ):
+        raise ProductValidationError(
+            "scene Reference residual QA detector identity is inconsistent"
+        )
+    if (
+        not isinstance(queries, list)
+        or not queries
+        or any(not isinstance(query, str) or not query.strip() for query in queries)
+    ):
+        raise ProductValidationError("scene Reference residual QA queries are invalid")
+    if (
+        isinstance(residual_area, bool)
+        or not isinstance(residual_area, (int, float))
+        or not math.isfinite(residual_area)
+        or not 0.0 <= residual_area <= 1.0
+        or isinstance(residual_threshold, bool)
+        or not isinstance(residual_threshold, (int, float))
+        or not math.isfinite(residual_threshold)
+        or not 0.0 <= residual_threshold < 1.0
+        or not isinstance(residual_pass, bool)
+    ):
+        raise ProductValidationError("scene Reference residual QA metrics are invalid")
+    expected_pass = residual_area <= residual_threshold
+    if residual_pass is not expected_pass or residual_pass is not True:
+        raise ProductValidationError("scene Reference failed residual robot QA")
+    quality_enabled = quality_control.get("residual_check_enabled")
+    quality_area = quality_control.get("residual_mask_area_fraction")
+    quality_threshold = quality_control.get("max_residual_area_fraction")
+    if (
+        quality_enabled is not enabled
+        or isinstance(quality_area, bool)
+        or not isinstance(quality_area, (int, float))
+        or not math.isfinite(quality_area)
+        or not 0.0 <= quality_area <= 1.0
+        or not math.isclose(quality_area, residual_area)
+        or isinstance(quality_threshold, bool)
+        or not isinstance(quality_threshold, (int, float))
+        or not math.isfinite(quality_threshold)
+        or not 0.0 <= quality_threshold < 1.0
+        or not math.isclose(quality_threshold, residual_threshold)
+    ):
+        raise ProductValidationError(
+            "scene Reference residual QA differs from quality control"
+        )
 
-    detected_queries = {item.query.casefold() for item in result.candidate_pool}
-    missing = sorted(
-        query.query
-        for query in queries
-        if query.required and query.query.casefold() not in detected_queries
+    digest = hashlib.sha256(artifact.jpeg).hexdigest()
+    if digest != artifact.sha256 or artifact.reference_id != f"sha256:{digest}":
+        raise ProductValidationError("scene Reference JPEG identity is inconsistent")
+    decoded = cv2.imdecode(
+        np.frombuffer(artifact.jpeg, dtype=np.uint8), cv2.IMREAD_COLOR
     )
-    if missing:
+    if decoded is None or decoded.size == 0:
+        raise ProductValidationError("scene Reference is not a decodable JPEG")
+    if decoded.shape[:2] != (artifact.height, artifact.width):
         raise ProductValidationError(
-            "YOLOE did not detect required task entities: " + ", ".join(missing)
+            "scene Reference JPEG dimensions differ from artifact metadata"
         )
     return result

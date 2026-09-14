@@ -40,6 +40,8 @@ def _record(path: Path) -> EpisodeRecord:
         robot_type="dual_arm",
         task="move the cup",
         real_view="camera_head",
+        real_frame_height=96,
+        real_frame_width=128,
         real_video=path,
     )
 
@@ -83,4 +85,15 @@ def test_video_frame_count_must_match_episode_metadata(tmp_path: Path) -> None:
     record = _record(path).model_copy(update={"episode_length": 82})
 
     with pytest.raises(ValueError, match="81 frames but episode metadata declares 82"):
+        decode_real_video(record, PromptConfig())
+
+
+def test_real_frame_zero_must_match_info_feature_dimensions(tmp_path: Path) -> None:
+    path = tmp_path / "real.mp4"
+    _write_video(path)
+    record = _record(path).model_copy(update={"real_frame_width": 127})
+
+    with pytest.raises(
+        ValueError, match="dimensions 128x96 differ from metadata 127x96"
+    ):
         decode_real_video(record, PromptConfig())

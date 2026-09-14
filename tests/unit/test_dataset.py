@@ -28,8 +28,14 @@ def _write_dataset(root: Path, *, view: str = "camera_head") -> Path:
             "episode_{episode_index:06d}.mp4"
         ),
         "features": {
-            f"camera_observations.color_images.{view}": {"dtype": "video"},
-            f"camera_observations.color_images.{view}_sim": {"dtype": "video"},
+            f"camera_observations.color_images.{view}": {
+                "dtype": "video",
+                "shape": [480, 640, 3],
+            },
+            f"camera_observations.color_images.{view}_sim": {
+                "dtype": "video",
+                "shape": [480, 640, 3],
+            },
         },
     }
     (dataset / "meta/info.json").write_text(json.dumps(info), encoding="utf-8")
@@ -64,6 +70,8 @@ def test_discovery_uses_only_configured_real_view(tmp_path: Path) -> None:
     assert records[0].domain == "lab-a"
     assert records[0].split == "train"
     assert records[0].real_view == "camera_head"
+    assert records[0].real_frame_height == 480
+    assert records[0].real_frame_width == 640
     assert records[0].real_video.name == "episode_000000.mp4"
     assert "_sim" not in str(records[0].real_video)
 
@@ -85,6 +93,28 @@ def test_discovery_requires_paired_sim_metadata_without_reading_sim(
     path.write_text(json.dumps(info), encoding="utf-8")
 
     with pytest.raises(ValueError, match="paired Sim view.*unavailable"):
+        discover_episodes(DatasetConfig(root=dataset))
+
+
+@pytest.mark.parametrize(
+    "shape",
+    [None, [480, 640], [480, 640, 4], [0, 640, 3], [480.0, 640, 3]],
+)
+def test_configured_real_view_requires_explicit_hwc_rgb_shape(
+    tmp_path: Path,
+    shape: object,
+) -> None:
+    dataset = _write_dataset(tmp_path)
+    path = dataset / "meta/info.json"
+    info = json.loads(path.read_text())
+    key = "camera_observations.color_images.camera_head"
+    if shape is None:
+        info["features"][key].pop("shape")
+    else:
+        info["features"][key]["shape"] = shape
+    path.write_text(json.dumps(info), encoding="utf-8")
+
+    with pytest.raises(ValueError, match=r"shape must be \[height, width, 3\]"):
         discover_episodes(DatasetConfig(root=dataset))
 
 

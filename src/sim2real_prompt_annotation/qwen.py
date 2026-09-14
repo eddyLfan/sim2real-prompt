@@ -21,9 +21,10 @@ from .models import RealFrame
 class ResponseParseError(ValueError):
     """The provider returned content that does not satisfy the requested schema."""
 
-    def __init__(self, message: str, raw_text: str):
+    def __init__(self, message: str, raw_text: str, *, truncated: bool = False) -> None:
         super().__init__(message)
         self.raw_text = raw_text
+        self.truncated = truncated
 
 
 @dataclass(frozen=True)
@@ -167,11 +168,16 @@ class QwenOpenAIClient(VLMClient):
         raw = completion.choices[0].message.content or ""
         if not isinstance(raw, str):
             raw = json.dumps(raw, ensure_ascii=False)
+        finish_reason = getattr(completion.choices[0], "finish_reason", None)
         try:
             payload = response_model.model_validate_json(_json_text(raw))
         except (ValidationError, ValueError, json.JSONDecodeError) as error:
             raise ResponseParseError(
-                f"{stage} returned invalid structured JSON: {error}", raw
+                f"{stage} returned invalid structured JSON: {error}",
+                raw,
+                truncated=(
+                    finish_reason == "length" or "EOF while parsing" in str(error)
+                ),
             ) from error
 
         usage = completion.usage

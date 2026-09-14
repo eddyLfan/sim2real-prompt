@@ -1,19 +1,13 @@
-# All relative paths are resolved from this YAML file. Environment overrides:
-# SIM2REAL_PROMPT_DATASET_ROOT and SIM2REAL_PROMPT_OUTPUT_ROOT.
+# Formal pre-experiment configuration for model_train/test.
+# DASHSCOPE_API_KEY and DASHSCOPE_BASE_URL are injected by the operator.
 dataset:
-  root: ./data
+  root: /media/datasets/EWM_SIM_REAL_PAIRS/model_train/test
   dataset_glob: "*"
   real_view: camera_head
   min_episode_frames: 81
-  # Optional JSON/JSONL keyed by canonical sample_id. It may add metadata but
-  # cannot override split.
   metadata_manifest: null
-  # Required only when neither meta/episodes.jsonl nor meta/info.json:splits
-  # supplies train/validation. JSONL rows are {"domain": ..., "split": ...}.
   split_manifest: null
 
-# Exactly eight uniformly spaced frames from the configured Real view and the
-# original task description are sent in one request. The response is prompt-only.
 prompt:
   frame_count: 8
   sampling: uniform
@@ -32,43 +26,35 @@ prompt:
     enable_thinking: false
     timeout_seconds: 180
 
-# The Reference is exactly one full-resolution Real frame-zero scene. RobotSeg
-# removes the whole robot, Big-LaMa fills the removal mask, and YOLOE performs
-# residual-robot QA only. No backend downloads weights or silently falls back.
 reference:
   backend: robotseg
+  # Fill all null digests with the exact production checkpoint hashes before
+  # the formal run. The repository never downloads or guesses a checkpoint.
   model_path: ./weights/robotseg.pt
   model_sha256: null
   robotseg_config: configs/robotseg-infer
   robot_category: robot
   device: cuda:0
   batch_size: 16
-
-  # Fixed vocabulary used only by the post-inpainting YOLOE residual check.
   robot_queries: [robot, robot arm, robot gripper]
   residual_check: true
+  # Official Ultralytics v8.3.0 asset; SHA-256:
+  # 8e439445c87338b79d9ce21dec109f4621e26df67e94d26ea1a98c1e64dce3e3
   yoloe_model_path: ./weights/yoloe-11s-seg.pt
-  yoloe_model_sha256: null
-  # MobileCLIPTS must already exist locally; YOLOE is never allowed to download it.
-  yoloe_text_model_path: ./weights/mobileclip_blt.ts
-  yoloe_text_model_sha256: null
+  yoloe_model_sha256: 8e439445c87338b79d9ce21dec109f4621e26df67e94d26ea1a98c1e64dce3e3
+  yoloe_text_model_path: ../weights/mobileclip_blt.ts
+  yoloe_text_model_sha256: a67804d1b0f07b8b9a20c1761ec0847f34660f5fa338ec70e8f3fce68ed95e54
   yoloe_image_size: 640
   yoloe_confidence: 0.05
   yoloe_iou_threshold: 0.50
   embedding_cache_size: 16
-
-  # Clean/expand the whole-robot mask before inpainting. Area and change gates
-  # fail closed instead of publishing the raw frame or a partial crop.
   mask_close_kernel: 9
   mask_dilation_pixels: 12
   min_mask_area_fraction: 0.002
   max_mask_area_fraction: 0.75
   max_residual_area_fraction: 0.002
   min_inpaint_change_fraction: 0.01
-
   inpainting_backend: big_lama
-  # Official layout: config.yaml plus models/best.ckpt. A compatible local
-  # TorchScript export is also accepted. Nothing is downloaded implicitly.
   inpainting_model_path: ./weights/big-lama
   inpainting_model_sha256: null
   inpainting_device: cuda:0
@@ -87,10 +73,8 @@ runtime:
   input_cost_per_million: null
   output_cost_per_million: null
 
-# This directory contains resumable branch checkpoints and run_report.json.
-# Training artifacts are published directly under each source dataset root.
 output:
-  root: ./outputs
+  root: /media/datasets/EWM_SIM_REAL_PAIRS/model_train/artifacts/test/prompt
   prompt_filename: episodes_prompt.jsonl
   reference_filename: reference_images.jsonl
   reference_directory: Reference

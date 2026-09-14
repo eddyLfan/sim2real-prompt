@@ -8,7 +8,6 @@ import pytest
 from sim2real_prompt_annotation.models import (
     PromptPayload,
     RealFrame,
-    ReferenceQuery,
 )
 from sim2real_prompt_annotation.prompt_branch import PromptBranch
 from sim2real_prompt_annotation.qwen import QwenOpenAIClient, VLMClient, VLMResponse
@@ -37,12 +36,6 @@ class RecordingClient(VLMClient):
                 "A dual-arm robot places a green tennis ball into a storage box "
                 "on a white workbench under diffuse overhead lighting."
             ),
-            reference_queries=[
-                ReferenceQuery(
-                    query="green tennis ball", role="primary", required=True
-                ),
-                ReferenceQuery(query="storage box", role="destination", required=True),
-            ],
         )
         return VLMResponse(
             payload=payload,
@@ -54,7 +47,7 @@ class RecordingClient(VLMClient):
         )
 
 
-def test_prompt_branch_makes_one_call_for_both_outputs() -> None:
+def test_prompt_branch_makes_one_call_for_the_prompt() -> None:
     client = RecordingClient()
     branch = PromptBranch(client, system_prompt="Return the compact JSON response.")
 
@@ -72,10 +65,7 @@ def test_prompt_branch_makes_one_call_for_both_outputs() -> None:
     assert "Put the green tennis ball into the storage box" in call["user_text"]
     assert '"robot_type":"dual_arm"' in call["user_text"]
     assert result.prompt.startswith("A dual-arm robot places")
-    assert [query.query for query in result.reference_queries] == [
-        "green tennis ball",
-        "storage box",
-    ]
+    assert "reference_queries" not in type(result).model_fields
     assert result.frame_indices == (0, 10, 20, 30, 40, 50, 60, 70)
     assert result.input_fingerprint.startswith("sha256:")
 
@@ -140,10 +130,6 @@ def test_qwen_content_contains_only_ordered_real_jpegs() -> None:
 def test_qwen_provider_validates_the_compact_payload() -> None:
     payload = PromptPayload(
         prompt="A robot places a mug onto a tray on a white workbench.",
-        reference_queries=[
-            ReferenceQuery(query="mug", role="primary", required=True),
-            ReferenceQuery(query="tray", role="destination", required=True),
-        ],
     )
     completion = SimpleNamespace(
         choices=[

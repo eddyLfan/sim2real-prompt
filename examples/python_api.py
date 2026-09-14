@@ -5,8 +5,7 @@ from pathlib import Path
 from sim2real_prompt_annotation import Sim2RealPreprocessingPipeline
 
 DATASET = Path(
-    "/media/datasets/EWM_SIM_REAL_PAIRS/model_test/"
-    "test_0905_agilex_cobotmagic2_12task_5episode"
+    "/media/datasets/EWM_SIM_REAL_PAIRS/model_train/test/train_00_hang_scissors"
 )
 
 
@@ -16,7 +15,7 @@ def main() -> None:
         dataset_root=DATASET,
     )
 
-    # Metadata-only: this does not open videos, initialize YOLOE, or require an API key.
+    # Metadata-only: no video, API, RobotSeg, Big-LaMa, or YOLOE is initialized.
     print(pipeline.inspect(show=5))
 
     # A normal rerun independently reuses valid Prompt and Reference checkpoints.

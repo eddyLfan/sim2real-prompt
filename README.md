@@ -1,35 +1,39 @@
 # sim2real-prompt
 
-`sim2real-prompt` 是 Transfer 项目唯一的配对数据预处理仓库。数据读取保持
-paired Sim/Real 数据集的身份和 split 约束，但预处理本身只消费配置的 **Real**
-主视角；不读取 Sim 视频，也不依赖仓库外的 `data_processing/`。
+`sim2real-prompt` 是 Transfer 项目唯一的配对数据预处理仓库。它保留 paired
+Sim/Real LeRobot 数据集的身份和 split 约束，但两条标注分支都只读取配置的 Real
+主视角（默认 `camera_head`）；不读取 Sim 视频，也不依赖仓库外的
+`data_processing/`。
 
-每个未命中缓存的 episode 只有两条工作分支：
+每个 episode 的固定数据流是：
 
 ```text
 Real camera_head video
-  ├─ 均匀 8 帧 + 原始任务/机器人元数据
-  │    └─ 单次 Qwen OpenAI-compatible VLM 请求
-  │         ├─ 一句英文视频内容 prompt
-  │         └─ 任务实体 reference_queries
-  └─ 原分辨率首帧 + reference_queries
-       └─ YOLOE-11s-seg → mask 质检/去重 → 候选池
-            └─ sample_id + seed 确定性随机选择 1～3 张 crop
+  ├─ 8 个均匀帧 + 原始任务/机器人元数据
+  │    └─ 一次 OpenAI-compatible API VLM 请求 ──> 一句英文视频 prompt
+  └─ 原分辨率 frame 0
+       └─ RobotSeg whole-robot mask
+            └─ closing + dilation
+                 └─ Big-LaMa inpainting
+                      └─ YOLOE residual-robot QA
+                           └─ 一张完整 robot_removed_scene Reference
 ```
 
-VLM 同一次响应同时给出 `prompt` 和 `reference_queries`，因此无需额外的本地任务
-分词器或第二次 API 请求。任务物体与目标只能来自权威任务描述；为了让
-Multi-Reference 同时覆盖物体与场景，VLM 也可从第一张图提取少量清晰可分割的机器人、
-工作区、环境或背景区域。YOLOE 是唯一定位后端：无有效 segmentation mask、漏检
-required 实体或没有 primary 任务物体时，该 episode 明确失败，不使用整帧或其他模型
-兜底。
+Prompt 和 Reference 有独立 fingerprint、成功 checkpoint 和失败状态。Reference
+不依赖 VLM 输出或任务分词；Prompt 命中缓存不会阻塞 Reference，反之亦然。只有两条
+分支都成功的 episode 才会 join 并原子发布给 Transfer。
 
-完整的模块边界、缓存键和逐文件职责见
+Reference 固定保留原图宽高与环境、桌面、任务物体、背景和光照，只去除机器人本体。
+它不是物体 crop。RobotSeg 无有效 whole-robot mask、mask 面积异常、Big-LaMa 变化不足、
+残留机器人超阈值或任一模型不可用时都 fail closed：不发布原首帧、局部 crop、OpenCV
+填充结果或其他分割模型兜底。
+
+完整模块边界、缓存键和逐文件职责见
 [docs/architecture.md](docs/architecture.md)。
 
-## 安装
+## 安装与生产模型
 
-Python 3.10+ 环境中安装主包以及 YOLOE 可选依赖：
+基础包和 YOLOE/OmegaConf 适配依赖：
 
 ```bash
 cd /media/vlm/vlm-model/asset_llm_ckpt/vla-representation/project/yifan/Transfer/sim2real-prompt
@@ -37,10 +41,26 @@ python3 -m pip install -e '.[reference]'
 cp config.example.yaml config.yaml
 ```
 
-将官方 `yoloe-11s-seg.pt` 权重放到 `config.yaml` 中
-`reference.model_path` 指向的位置。仓库不附带模型权重。
+生产 Reference 还需要在同一运行环境中安装官方
+[RobotSeg](https://github.com/showlab/RobotSeg) 与
+[LaMa](https://github.com/advimman/lama) runtime。RobotSeg 的 CUDA/PyTorch 组合应按其
+官方安装说明构建；LaMa 源码目录必须能提供 `saicinpainting` import。仓库不会联网安装
+它们，也不会自动下载权重。
 
-配置 Qwen 的 OpenAI-compatible endpoint；密钥不要写入 YAML、代码或日志：
+在 `config.yaml` 中设置以下四个本地模型资产：
+
+| 配置 | 需要的本地产物 | 用途 |
+| --- | --- | --- |
+| `reference.model_path` | RobotSeg 的 `robotseg.pt` | frame 0 whole-robot mask |
+| `reference.inpainting_model_path` | `config.yaml` + `models/best.ckpt` 的 Big-LaMa 目录，或兼容 TorchScript 文件 | 填补扩张后的 robot mask |
+| `reference.yoloe_model_path` | `yoloe-11s-seg.pt` | 仅做 inpaint 后残留机器人 QA |
+| `reference.yoloe_text_model_path` | 与 Ultralytics 版本匹配的 `mobileclip_blt.ts` | YOLOE 本地文本编码器 |
+
+正式批处理必须填写四个对应的 SHA-256 配置。Big-LaMa 目录的摘要对应
+`models/best.ckpt`。所有资产都应在批处理节点提前准备并完成离线预热；pipeline 不允许
+Ultralytics 隐式下载 MobileCLIP。源码和模型权重均不纳入 Git。
+
+配置 API VLM 的 OpenAI-compatible endpoint；密钥不要写入 YAML、代码或日志：
 
 ```bash
 export DASHSCOPE_API_KEY='your-key'
@@ -53,69 +73,68 @@ export DASHSCOPE_BASE_URL='https://dashscope.aliyuncs.com/compatible-mode/v1'
 
 ## 数据约束
 
-每个被发现的数据集都必须满足以下条件：
+每个被发现的数据集都必须满足：
 
-- `meta/info.json` 显式包含 trim 后非空的 `source_id` 和 `domain`；目录名不会作为
-  回退身份，且同一次发现中的 `source_id` 必须全局唯一。
+- `meta/info.json` 显式包含 trim 后非空的 `source_id` 和 `domain`；同次发现中的
+  `source_id` 全局唯一。
 - canonical `sample_id` 固定为
   `f"{len(source_id)}:{source_id}:{episode_index}"`，不做有损字符替换。
 - `meta/episodes.jsonl` 中 `episode_index` 非负且唯一，`length` 默认至少 81，
   `tasks[0]` 是权威任务描述。
-- 配置的 Real 视角默认是 `camera_head`，必须唯一存在；不会自动改用腕部视角。
-- 每个 episode 必须能从 episode 自带 `split`、`meta/info.json:splits` 或
-  `dataset.split_manifest` 的完整 domain assignment 中唯一解析为 `train` 或
-  `validation`；多个来源同时存在时必须一致，任何冲突都会失败。
-- 同一 domain 在一个或多个数据集中必须始终属于同一 split；
+- 配置的 Real 视角必须唯一存在；不会自动切换到腕部视角。
+- episode split 必须由行内 `split`、`meta/info.json:splits` 或
+  `dataset.split_manifest` 唯一确定；多来源同时存在时必须一致。
+- 同一 domain 在一个或多个 source 中不能跨 train/validation；
   `metadata_manifest` 不允许覆盖 split。
 
-`split_manifest` 的 JSONL 格式为：
+`split_manifest` 是每行一个 domain assignment 的 JSONL：
 
 ```json
 {"domain":"lab_a","split":"train"}
 {"domain":"lab_b","split":"validation"}
 ```
 
-源数据内容或任务语义发生正式变更时，应分配新的 `source_id`，并重新生成缓存；
-不要让同一个身份静默代表两版数据。
+源数据内容或任务语义发生正式变更时，应分配新的 `source_id` 并重新生成缓存，不能让
+同一身份静默代表两版数据。
 
-## 在指定小测试集上正式运行
+## 在小测试集上运行正式配置
 
-以下命令直接使用原测试数据集，不创建软链接、镜像或临时 split。该数据集当前含
-60 个 episode（12 个任务 × 5 个 episode），并已提供稳定的 `source_id`、`domain`
-和 `train` split。
+当前预实验集位于
+`/media/datasets/EWM_SIM_REAL_PAIRS/model_train/test`，包含 12 个 source、48 个
+episode。先确认四个模型资产、runtime、GPU 和 API 凭据都已经就绪，再执行：
 
 ```bash
-TEST_DATASET=/media/datasets/EWM_SIM_REAL_PAIRS/model_test/test_0905_agilex_cobotmagic2_12task_5episode
+cd /media/vlm/vlm-model/asset_llm_ckpt/vla-representation/project/yifan/Transfer
+TEST_DATASET=/media/datasets/EWM_SIM_REAL_PAIRS/model_train/test
 
-# 只读元数据预检：不解码视频、不调用 API、不加载 YOLOE。
-sim2real-prompt inspect \
-  --config config.yaml \
-  --dataset "$TEST_DATASET" \
+# 只读元数据预检：不解码视频、不调用 API、不加载模型。
+PYTHONPATH=sim2real-prompt/src .venv/bin/python -m sim2real_prompt_annotation inspect \
+  --config sim2real-prompt/config.test.yaml \
+  --dataset "${TEST_DATASET}" \
   --show 5
 
-# 先用 episode 0 跑完整正式链路，并直接审计发布结果。
-sim2real-prompt run \
-  --config config.yaml \
-  --dataset "$TEST_DATASET" \
+# 先跑一条完整正式链路并审计。
+bash scripts/process.sh \
+  --config sim2real-prompt/config.test.yaml \
+  --dataset "${TEST_DATASET}/train_00_hang_scissors" \
   --episodes 0
 
-sim2real-prompt audit \
-  --config config.yaml \
-  --dataset "$TEST_DATASET" \
-  --episodes 0
-
-# 单条确认后处理完整 60 条；已完成的两个分支会分别命中缓存。
-sim2real-prompt run --config config.yaml --dataset "$TEST_DATASET"
-sim2real-prompt audit --config config.yaml --dataset "$TEST_DATASET"
+# 人工检查 frame0、whole-robot mask 和 clean scene 后再跑 48 条。
+bash scripts/process.sh \
+  --config sim2real-prompt/config.test.yaml \
+  --dataset "${TEST_DATASET}" \
+  --gpus 0,1,2,3,4,5,6,7 \
+  --api-concurrency 16 \
+  --decode-workers 16 \
+  --micro-batch-size 2
 ```
 
-`run` 会直接在该测试数据集内发布训练产物，所以运行账号需要对数据集的
-`Reference/` 和 `meta/` 有写权限。`--force` 会忽略有效缓存并重新调用 API/YOLOE；
-普通续跑不要加它。
+`run` 会在源数据集内发布 `Reference/` 和 `meta/`，运行账号需要相应写权限。
+`--force` 会忽略两个分支的有效缓存并重新调用 API/模型，普通续跑不要加。父仓库并行
+入口先做全局 metadata 预检，再按 source 稳定分片到常驻 GPU worker；总 API/decode
+并发会在 worker 间分配，最终仍进行一次全数据集 audit。
 
 ## CLI
-
-CLI 只保留三个命令：
 
 ```bash
 sim2real-prompt inspect --config config.yaml [--dataset PATH] [--episodes 0,2,5-9]
@@ -123,83 +142,83 @@ sim2real-prompt run     --config config.yaml [--dataset PATH] [--episodes 0,2,5-
 sim2real-prompt audit   --config config.yaml [--dataset PATH] [--episodes 0,2,5-9]
 ```
 
-- `inspect`：只读发现、身份/split/task/Real 视角预检。
-- `run`：执行两个分支、保存独立 checkpoint、发布成功 episode，并默认做最终审计。
-- `audit`：不需要 API key 或 YOLOE，校验 manifest 关联、1～3 张图片、路径、JPEG
-  哈希、首帧来源和 primary Reference。
+- `inspect`：只读发现并预检身份、split、task 和 Real 视角。
+- `run`：执行两个独立分支、保存 checkpoint、join 成功 episode，并默认审计。
+- `audit`：无需 API key 或模型，校验 schema v3、exact-one 图片、路径、尺寸、哈希、
+  frame 0、场景类型和 Prompt 关联。
 
 根目录不是单个 LeRobot 数据集时，可在配置或命令行设置 `dataset_glob`。`--limit`
-适合快速抽取发现顺序中的前 N 条；`--episodes` 按 episode index 精确选择。
+适合快速选择发现顺序中的前 N 条；`--episodes` 按 episode index 精确选择。
 
 ## 输出契约
 
-Transfer 训练契约只包含以下三个产物（发布时还会在 `meta/` 使用隐藏锁文件与临时
-transaction marker 协调并发写入）：
+Transfer 只消费以下三个产物：
 
 ```text
 <dataset>/
   Reference/
     episode_000000/
       reference_00.jpg
-      reference_01.jpg
   meta/
     episodes_prompt.jsonl
     reference_images.jsonl
 ```
 
-`meta/episodes_prompt.jsonl` 每个 episode 恰好包含：
+`episodes_prompt.jsonl` 每个 episode 的 `reference_ids` 固定为单元素列表：
 
 ```json
-{"episode_index":0,"prompt":"The Agilex robot aligns the handles of the preassembled banana bunch in the same direction on a worktable under even indoor lighting.","reference_ids":["sha256:..."]}
+{"episode_index":0,"prompt":"The Agilex robot hangs scissors on a rack in a well-lit workshop.","reference_ids":["sha256:..."]}
 ```
 
-`meta/reference_images.jsonl` 使用 schema v2，并只发布最终选中的 1～3 张图；候选池
-只留在续跑 checkpoint 中：
+`reference_images.jsonl` 固定使用 schema v3，并包含恰好一个 full-frame 环境
+Reference：
 
 ```json
-{"schema_version":2,"episode_index":0,"references":[{"reference_id":"sha256:...","reference_path":"Reference/episode_000000/reference_00.jpg","source_view":"camera_head","source_frame_index":0,"query":"banana","label":"banana","role":"primary","scope":"objects","confidence":0.83,"bbox_xyxy":[677.0,368.0,820.0,498.0],"crop_xyxy":[660,352,838,514],"sha256":"...","provenance":{"backend":"yoloe","model":"yoloe-11s-seg.pt","selection_seed":42}}]}
+{"schema_version":3,"episode_index":0,"references":[{"reference_id":"sha256:...","reference_path":"Reference/episode_000000/reference_00.jpg","source_view":"camera_head","source_frame_index":0,"scope":"environment","reference_kind":"robot_removed_scene","width":1280,"height":720,"source_frame_sha256":"...","mask_sha256":"...","mask_area_fraction":0.182,"sha256":"...","provenance":{"operation":"robot_removal_inpainting","segmenter":{"backend":"robotseg"},"final_mask":{"sha256":"...","area_fraction":0.182},"inpainter":{"backend":"big_lama"},"residual_qa":{"enabled":true,"detector":{"backend":"yoloe"},"queries":["robot","robot arm","robot gripper"],"area_fraction":0.0,"threshold":0.002,"pass":true},"quality_control":{"outside_mask_unchanged":true,"residual_check_enabled":true,"residual_mask_area_fraction":0.0,"max_residual_area_fraction":0.002}}}]}
 ```
 
-`episodes_prompt.jsonl.reference_ids` 的内容与顺序必须和同 episode 的
-`reference_images.jsonl.references[*].reference_id` 完全相同。Reference ID 是最终
-JPEG 字节的 SHA-256，图片固定来自 Real 首帧。
+`reference_id` 是最终 JPEG 字节 SHA-256 的 `sha256:` 形式，且必须和同一行的
+`sha256`、Prompt row 的单元素 `reference_ids` 一致。`source_frame_index` 恒为 0；
+图片宽高必须与源 frame 0 一致。`mask_sha256` 标识完整分辨率二值 removal-mask 的像素，
+mask PNG 只保存在可恢复 checkpoint 中，不进入 Transfer 训练 manifest。
 
-可恢复的中间状态写到 `output.root`，默认是仓库内的 `outputs/`：
+中间状态位于 `output.root`：
 
 ```text
 outputs/
   prompt/<hash-prefix>/<sample-hash>.json
   reference/<hash-prefix>/<sample-hash>.json
-  reference_images/<hash-prefix>/<sample-hash>/<cache-key>/reference_XX.jpg
+  reference_failures/<hash-prefix>/<sample-hash>.json
+  reference_images/<hash-prefix>/<sample-hash>/<cache-key>/
+    reference_00.jpg
+    removal_mask.png
   run_report.json
 ```
 
-这三类是 checkpoint/报告，不是训练数据契约。
+这些是 checkpoint/诊断产物，不是训练数据契约。
 
 ## 性能、失败与续跑
 
-- Prompt 未缓存时，每个视频只打开一次，并直接 seek 到包含首尾的 8 个均匀位置，
-  不解码中间无用帧；原始 BGR 首帧直接复用给 Reference，不经过有损 JPEG 往返。
-  解码由 `runtime.decode_workers` 并发执行。
-- API 请求由 `runtime.api_concurrency` 控制并发。结构化响应错误、质检错误、超时、
-  限流和服务端错误按 `runtime.api_retry_count` 指数退避重试。
-- YOLOE 按完整 query signature 分组做 GPU batch，常驻复用 MobileCLIP 文本编码器，并用
-  有界 LRU 缓存重复词表的 embedding。首次文本提示运行会按 Ultralytics 机制准备额外的
-  MobileCLIP 权重和 tokenizer，因此应在批处理节点联网预热一次，再进入离线大批处理。
-- Prompt 和 Reference 使用不同 fingerprint/checkpoint。若 Prompt 已缓存而 Reference
-  缺失，只解码首帧；查询、权重、视频或相关配置改变时只失效受影响的分支。
-- `runtime.fail_fast: false` 时，单条失败会记录在 `run_report.json`，其他 episode 继续；
-  命令以非零状态结束并报告 `partial`。失败条目不生成伪 Reference，也不覆盖成功条目。
-- 发布采用原子写、数据集级文件锁和 transaction marker；子集运行始终 merge，不会
-  删除 manifest 中未选中的旧 episode。`status` 表示本次 selection 是否成功，
-  `annotations_ready` 只有在全量 annotation manifest 与所有源 episode 精确一致且审计
-  通过时才为 true；它不替代 Transfer 对视频、Parquet、关节映射和训练配置的完整预检。
-  中断后重跑必须覆盖 marker 记录的全部 episode，Transfer reader 也会拒绝中断代次。
+- Prompt miss 时每个视频一次定点解码 8 个均匀位置；该 bundle 已含 frame 0，可供
+  Reference 复用。只有 Reference miss 时只解码 frame 0。不会扫描整段视频。
+- 每个未缓存 episode 只有一次 VLM 逻辑生成任务，以及一次 RobotSeg、一次 Big-LaMa 和
+  一次 YOLOE residual QA；API 瞬时错误或响应截断时，逻辑生成任务可能按配置重试。
+  本地模型在 worker 生命周期内懒加载并复用。
+- API 由 `runtime.api_concurrency` 控制。结构化响应截断时可逐次扩大 completion 预算，
+  其他可重试错误按 runtime 配置指数退避。
+- 两个分支的 cache key 各自只绑定相关输入。Prompt 模型或 system prompt 变化不会使
+  Reference 失效；RobotSeg/Big-LaMa/YOLOE 权重或 mask 参数变化不会使 Prompt 失效。
+- 确定性 Reference 失败写入 `reference_failures/`，相同 key 续跑不重复昂贵模型调用；
+  runtime 异常不伪装为成功 Reference。
+- `runtime.fail_fast: false` 时，单条失败写入 `run_report.json` 并继续其他 episode；命令
+  最终返回非零且状态为 `partial`。失败条目不会发布 raw frame fallback。
+- 发布采用原子写、dataset lock 和 transaction marker。子集运行 merge 既有 row；中断
+  代次必须显式恢复。迁移到 schema v3 时，成功发布会清理该 episode 旧的额外
+  `reference_01.jpg`、`reference_02.jpg` 等文件。
 
 ## Python API
 
-高层接口只有 `Sim2RealPreprocessingPipeline`，示例见
-[examples/python_api.py](examples/python_api.py)：
+高层接口只有 `Sim2RealPreprocessingPipeline`：
 
 ```python
 from sim2real_prompt_annotation import Sim2RealPreprocessingPipeline
@@ -216,7 +235,6 @@ print(pipeline.audit(episodes="0,2,5-9"))
 
 ## 许可证
 
-本仓库自身代码为 Apache-2.0。可选 Reference 依赖 Ultralytics/YOLOE 涉及
-AGPL-3.0，商业使用可另行取得商业许可；源码和模型权重均未 vendored。使用者负责
-获取权重并遵守适用条款，详见
+本仓库自身代码为 Apache-2.0。RobotSeg、LaMa、Ultralytics/YOLOE 的源码和模型权重
+均由使用者独立取得；其中 Ultralytics 涉及 AGPL-3.0 或商业许可。详见
 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。

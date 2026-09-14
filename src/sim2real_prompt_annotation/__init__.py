@@ -1,4 +1,4 @@
-"""Real-video Prompt and Multi-Reference preprocessing for Transfer."""
+"""Real-video Prompt and robot-removed scene Reference preprocessing."""
 
 from .api import PromptAnnotationPipeline, Sim2RealPreprocessingPipeline
 from .config import PipelineConfig, load_config

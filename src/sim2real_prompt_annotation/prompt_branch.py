@@ -1,4 +1,4 @@
-"""Real-only VLM branch for prompt text and YOLOE reference queries."""
+"""Real-only VLM branch for one compact video prompt."""
 
 from __future__ import annotations
 
@@ -37,7 +37,7 @@ def _input_fingerprint(
 ) -> str:
     digest = hashlib.sha256()
     request = {
-        "schema": "prompt-branch-v1",
+        "schema": "prompt-branch-v2",
         "task_description": task_description,
         "robot_metadata": robot_metadata,
         "system_prompt_sha256": hashlib.sha256(
@@ -117,8 +117,8 @@ class PromptBranch:
             "AUTHORITATIVE TASK AND ROBOT METADATA:\n"
             f"{_canonical_json(authoritative_input)}\n\n"
             "Use the eight ordered Real frames supplied after this text only for "
-            "visible execution and scene context. Return the prompt and YOLOE "
-            "reference queries in the requested schema."
+            "visible execution and scene context. Return the one-sentence prompt "
+            "in the requested schema."
         )
 
     def run(
@@ -128,6 +128,7 @@ class PromptBranch:
         task_description: str,
         robot_metadata: Mapping[str, Any],
         images: Sequence[RealFrame],
+        max_tokens: int | None = None,
     ) -> PromptResult:
         sample_id = sample_id.strip()
         task_description = task_description.strip()
@@ -136,6 +137,9 @@ class PromptBranch:
         if not task_description:
             raise ValueError("task_description must be non-empty")
         ordered = self._validate_images(images)
+        effective_max_tokens = self.max_tokens if max_tokens is None else max_tokens
+        if effective_max_tokens < 1:
+            raise ValueError("max_tokens must be positive")
         fingerprint = _input_fingerprint(
             task_description=task_description,
             robot_metadata=robot_metadata,
@@ -143,11 +147,11 @@ class PromptBranch:
             system_prompt=self.system_prompt,
             provider_identity=self.provider_identity,
             temperature=self.temperature,
-            max_tokens=self.max_tokens,
+            max_tokens=effective_max_tokens,
         )
 
         # Deliberately one call: caching, rate limiting, and retries belong to an
-        # injected VLMClient service and therefore cover both output fields together.
+        # injected VLMClient service and cover the complete caption operation.
         response = self.client.generate(
             sample_id=sample_id,
             stage="prompt",
@@ -156,13 +160,12 @@ class PromptBranch:
             images=ordered,
             response_model=PromptPayload,
             temperature=self.temperature,
-            max_tokens=self.max_tokens,
+            max_tokens=effective_max_tokens,
         )
         payload = PromptPayload.model_validate(response.payload.model_dump())
         return PromptResult(
             sample_id=sample_id,
             prompt=payload.prompt,
-            reference_queries=payload.reference_queries,
             model=response.model,
             request_id=response.request_id,
             input_tokens=response.input_tokens,

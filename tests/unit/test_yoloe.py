@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 from dataclasses import dataclass
 
 import numpy as np
@@ -8,7 +9,6 @@ import pytest
 from sim2real_prompt_annotation.yoloe import (
     DetectionRequest,
     YOLOEDetector,
-    YOLOEQuery,
     YOLOEUnavailableError,
     normalize_queries,
 )
@@ -16,7 +16,6 @@ from sim2real_prompt_annotation.yoloe import (
 
 @dataclass
 class _Boxes:
-    xyxy: np.ndarray
     conf: np.ndarray
     cls: np.ndarray
 
@@ -33,6 +32,8 @@ class _Result:
 
 
 class _FakeYOLOE:
+    task = "segment"
+
     def __init__(self) -> None:
         self.text_calls: list[list[str]] = []
         self.set_calls: list[tuple[list[str], object]] = []
@@ -50,17 +51,15 @@ class _FakeYOLOE:
     def predict(self, source: list[np.ndarray], **kwargs: object) -> list[_Result]:
         assert kwargs["verbose"] is False
         assert kwargs["retina_masks"] is False
-        assert kwargs["agnostic_nms"] is False
         self.predict_batch_sizes.append(len(source))
         results = []
         for frame in source:
             height, width = frame.shape[:2]
             mask = np.zeros((1, height // 2, width // 2), dtype=np.float32)
-            mask[:, 1:-1, 1:-1] = 1.0
+            mask[:, 2:-2, 2:-2] = 1.0
             results.append(
                 _Result(
                     boxes=_Boxes(
-                        xyxy=np.asarray([[1, 2, width - 1, height - 2]], dtype=float),
                         conf=np.asarray([0.91], dtype=float),
                         cls=np.asarray([0], dtype=float),
                     ),
@@ -70,43 +69,51 @@ class _FakeYOLOE:
         return results
 
 
-class _InnerTextModel:
+class _FakeTextModel:
+    def tokenize(self, texts: list[str]) -> list[str]:
+        return texts
+
+    def encode_text(self, tokens: list[str]) -> list[str]:
+        return tokens
+
+
+class _FakeParameter:
+    device = "cpu"
+
+
+class _OfficialInnerModel:
     def __init__(self) -> None:
-        self.calls: list[tuple[list[str], bool]] = []
+        self.clip_model: object | None = None
+        self.text_calls: list[tuple[list[str], bool]] = []
+
+    def parameters(self):
+        return iter([_FakeParameter()])
 
     def get_text_pe(
         self, classes: list[str], *, cache_clip_model: bool = False
     ) -> object:
-        self.calls.append((classes.copy(), cache_clip_model))
-        return tuple(f"inner:{name}" for name in classes)
+        assert self.clip_model is not None
+        self.text_calls.append((classes.copy(), cache_clip_model))
+        return tuple(f"local:{name}" for name in classes)
 
 
 class _OfficialStyleYOLOE(_FakeYOLOE):
     def __init__(self) -> None:
         super().__init__()
-        self.model = _InnerTextModel()
+        self.model = _OfficialInnerModel()
 
 
 def _frame(value: int = 0) -> np.ndarray:
     return np.full((20, 30, 3), value, dtype=np.uint8)
 
 
-def test_normalize_queries_accepts_dtos_and_merges_duplicate_labels() -> None:
-    queries = normalize_queries(
-        [
-            {"text": " red   cup ", "role": "secondary"},
-            YOLOEQuery(query="Red Cup", role="primary", required=True),
-            {"label": "basket", "role": "destination"},
-        ]
-    )
+def test_normalize_queries_accepts_strings_mappings_and_deduplicates() -> None:
+    queries = normalize_queries([" robot ", {"query": "Robot"}, {"label": "robot arm"}])
 
-    assert [query.query for query in queries] == ["red cup", "basket"]
-    assert queries[0].role == "primary"
-    assert queries[0].primary is True
-    assert queries[0].required is True
+    assert queries == ("robot", "robot arm")
 
 
-def test_detector_is_lazy_and_reuses_cached_text_embeddings() -> None:
+def test_detector_is_lazy_and_returns_full_resolution_raster_masks() -> None:
     fake = _FakeYOLOE()
     factory_calls: list[str] = []
 
@@ -114,74 +121,40 @@ def test_detector_is_lazy_and_reuses_cached_text_embeddings() -> None:
         factory_calls.append(path)
         return fake
 
-    detector = YOLOEDetector(model_factory=factory)
+    detector = YOLOEDetector(device="cpu", model_factory=factory)
     assert detector.loaded is False
 
-    queries = [
-        {"query": "red cup", "role": "primary", "required": True},
-        {"query": "basket", "role": "destination"},
-    ]
-    first = detector.predict([_frame()], queries)
-    second = detector.predict([_frame(1)], queries)
+    first = detector.predict([_frame()], ["robot", "robot arm"])
+    second = detector.predict([_frame(1)], ["robot", "robot arm"])
 
     assert factory_calls == ["yoloe-11s-seg.pt"]
-    assert fake.text_calls == [["red cup", "basket"]]
+    assert fake.text_calls == [["robot", "robot arm"]]
     assert len(fake.set_calls) == 1
     assert fake.predict_batch_sizes == [1, 1]
-    assert first[0][0].query == "red cup"
-    assert first[0][0].required is True
-    assert first[0][0].mask_polygon is not None
-    assert first[0][0].bbox_xyxy == (2.0, 2.0, 28.0, 18.0)
+    assert first[0][0].query == "robot"
+    assert first[0][0].mask.shape == (20, 30)
+    assert first[0][0].mask.dtype == np.uint8
+    assert first[0][0].bbox_xyxy == (4, 4, 26, 16)
     assert second[0][0].image_width == 30
-
-    detector.predict([_frame()], [{"query": "green tray"}])
-    detector.predict([_frame()], queries)
-    assert len(fake.text_calls) == 2
-    assert len(fake.set_calls) == 3
-    assert detector.cached_query_signatures == (
-        ("green tray",),
-        ("red cup", "basket"),
-    )
 
 
 def test_embedding_cache_is_lru_bounded() -> None:
     fake = _FakeYOLOE()
     detector = YOLOEDetector(
+        device="cpu",
         model_factory=lambda _: fake,
         embedding_cache_size=1,
     )
 
-    detector.predict([_frame()], [{"query": "cup"}])
-    detector.predict([_frame()], [{"query": "tray"}])
-    detector.predict([_frame()], [{"query": "cup"}])
+    detector.predict([_frame()], ["robot"])
+    detector.predict([_frame()], ["robot arm"])
+    detector.predict([_frame()], ["robot"])
 
-    assert fake.text_calls == [["cup"], ["tray"], ["cup"]]
-    assert detector.cached_query_signatures == (("cup",),)
-
-
-def test_detector_keeps_supported_ultralytics_text_encoder_resident() -> None:
-    fake = _OfficialStyleYOLOE()
-    detector = YOLOEDetector(model_factory=lambda _: fake)
-
-    detector.predict([_frame()], [{"query": "cup"}])
-    detector.predict([_frame()], [{"query": "tray"}])
-
-    assert fake.model.calls == [(["cup"], True), (["tray"], True)]
-    assert fake.text_calls == []
+    assert fake.text_calls == [["robot"], ["robot arm"], ["robot"]]
+    assert detector.cached_query_signatures == (("robot",),)
 
 
-def test_readiness_prewarms_text_prompting_only_once() -> None:
-    fake = _FakeYOLOE()
-    detector = YOLOEDetector(device="cpu", model_factory=lambda _: fake)
-
-    detector.ensure_ready()
-    detector.ensure_ready()
-
-    assert fake.text_calls == [["object"]]
-    assert fake.active_classes == ["object"]
-
-
-def test_readiness_rejects_non_segmentation_checkpoint_before_prompting() -> None:
+def test_readiness_rejects_non_segmentation_checkpoint() -> None:
     fake = _FakeYOLOE()
     fake.task = "detect"
     detector = YOLOEDetector(device="cpu", model_factory=lambda _: fake)
@@ -192,55 +165,109 @@ def test_readiness_rejects_non_segmentation_checkpoint_before_prompting() -> Non
     assert fake.text_calls == []
 
 
-def test_cache_identity_binds_ultralytics_runtime_version() -> None:
-    detector = YOLOEDetector(device="cpu", model_factory=lambda _: _FakeYOLOE())
-
-    assert "ultralytics_version" in detector.cache_identity()
-
-
-def test_predict_requests_batches_frames_with_identical_query_signature() -> None:
+def test_readiness_rejects_wrong_checkpoint_hash(tmp_path) -> None:
+    checkpoint = tmp_path / "yoloe.pt"
+    checkpoint.write_bytes(b"not-the-expected-checkpoint")
     fake = _FakeYOLOE()
-    detector = YOLOEDetector(model_factory=lambda _: fake)
-    cup = [{"query": "cup", "primary": True}]
-    tray = [{"query": "tray", "required": True}]
+    detector = YOLOEDetector(
+        checkpoint,
+        model_sha256="0" * 64,
+        device="cpu",
+        model_factory=lambda _: fake,
+    )
+
+    with pytest.raises(YOLOEUnavailableError, match="SHA-256 mismatch"):
+        detector.ensure_ready()
+
+
+def test_production_preflight_rejects_missing_mobileclip_without_download(
+    tmp_path,
+) -> None:
+    checkpoint = tmp_path / "yoloe.pt"
+    checkpoint.write_bytes(b"placeholder")
+    detector = YOLOEDetector(
+        checkpoint,
+        text_model_path=tmp_path / "missing-mobileclip.ts",
+        device="cpu",
+    )
+
+    with pytest.raises(YOLOEUnavailableError, match="implicit downloads are disabled"):
+        detector.ensure_ready()
+
+
+def test_explicit_local_mobileclip_is_injected_and_bound_to_cache_identity(
+    tmp_path,
+) -> None:
+    text_path = tmp_path / "mobileclip_blt.ts"
+    text_path.write_bytes(b"local-mobileclip")
+    expected_sha = hashlib.sha256(b"local-mobileclip").hexdigest()
+    fake = _OfficialStyleYOLOE()
+    factory_calls: list[tuple[str, object]] = []
+
+    def text_factory(path: str, device: object) -> _FakeTextModel:
+        factory_calls.append((path, device))
+        return _FakeTextModel()
+
+    detector = YOLOEDetector(
+        device="cpu",
+        text_model_path=text_path,
+        text_model_sha256=expected_sha,
+        model_factory=lambda _: fake,
+        text_model_factory=text_factory,
+    )
+
+    detector.ensure_ready()
+
+    assert factory_calls == [(str(text_path.resolve()), "cpu")]
+    assert isinstance(fake.model.clip_model, _FakeTextModel)
+    assert fake.model.text_calls == [(["robot"], True)]
+    identity = detector.cache_identity()
+    assert identity["text_model"]["file"]["sha256"] == expected_sha
+    assert identity["configured_text_model_sha256"] == expected_sha
+    assert identity["text_asset_policy"] == "explicit-local-only-v1"
+
+
+def test_mobileclip_hash_mismatch_fails_before_text_model_factory(tmp_path) -> None:
+    text_path = tmp_path / "mobileclip_blt.ts"
+    text_path.write_bytes(b"wrong")
+    calls = 0
+
+    def text_factory(_: str, __: object) -> _FakeTextModel:
+        nonlocal calls
+        calls += 1
+        return _FakeTextModel()
+
+    detector = YOLOEDetector(
+        device="cpu",
+        text_model_path=text_path,
+        text_model_sha256="0" * 64,
+        model_factory=lambda _: _OfficialStyleYOLOE(),
+        text_model_factory=text_factory,
+    )
+
+    with pytest.raises(YOLOEUnavailableError, match="MobileCLIPTS SHA-256 mismatch"):
+        detector.ensure_ready()
+    assert calls == 0
+
+
+def test_predict_requests_batches_identical_residual_vocabularies() -> None:
+    fake = _FakeYOLOE()
+    detector = YOLOEDetector(device="cpu", model_factory=lambda _: fake)
 
     outputs = detector.predict_requests(
         [
-            DetectionRequest(_frame(1), cup, "one"),
-            DetectionRequest(_frame(2), tray, "two"),
-            DetectionRequest(_frame(3), cup, "three"),
+            DetectionRequest(_frame(1), ["robot"], "one"),
+            DetectionRequest(_frame(2), ["robot arm"], "two"),
+            DetectionRequest(_frame(3), ["robot"], "three"),
         ]
     )
 
-    assert [output[0].query for output in outputs] == ["cup", "tray", "cup"]
+    assert [output[0].query for output in outputs] == [
+        "robot",
+        "robot arm",
+        "robot",
+    ]
     assert fake.predict_batch_sizes == [2, 1]
-    assert len(fake.text_calls) == 2
-
-
-def test_predict_requests_separates_same_text_with_different_semantics() -> None:
-    fake = _FakeYOLOE()
-    detector = YOLOEDetector(model_factory=lambda _: fake)
-
-    outputs = detector.predict_requests(
-        [
-            DetectionRequest(
-                _frame(1),
-                [{"query": "cup", "role": "primary", "required": True}],
-                "primary",
-            ),
-            DetectionRequest(
-                _frame(2),
-                [{"query": "cup", "role": "secondary", "required": False}],
-                "secondary",
-            ),
-        ]
-    )
-
-    assert fake.predict_batch_sizes == [1, 1]
-    assert [output[0].role for output in outputs] == ["primary", "secondary"]
-    assert [output[0].required for output in outputs] == [True, False]
-    # Text embeddings are still shared because the detector vocabulary is identical.
-    assert fake.text_calls == [["cup"]]
 
 
 def test_detector_rejects_empty_queries_before_loading_model() -> None:
@@ -251,30 +278,7 @@ def test_detector_rejects_empty_queries_before_loading_model() -> None:
         factory_called = True
         return _FakeYOLOE()
 
-    detector = YOLOEDetector(model_factory=factory)
+    detector = YOLOEDetector(device="cpu", model_factory=factory)
     with pytest.raises(ValueError, match="at least one"):
         detector.predict([_frame()], [])
     assert factory_called is False
-
-
-def test_original_image_polygon_wins_over_letterboxed_mask_tensor() -> None:
-    frame = _frame()
-    result = _Result(
-        boxes=_Boxes(
-            xyxy=np.asarray([[0, 0, 30, 20]], dtype=float),
-            conf=np.asarray([0.9], dtype=float),
-            cls=np.asarray([0], dtype=float),
-        ),
-        masks=_Masks(np.ones((1, 8, 8), dtype=np.float32)),
-    )
-    result.masks.xy = [
-        np.asarray([[5, 6], [10, 6], [10, 12], [5, 12]], dtype=np.float32)
-    ]
-
-    detections = YOLOEDetector._parse_result(
-        result,
-        frame=frame,
-        queries=(YOLOEQuery(query="cup", role="primary", required=True),),
-    )
-
-    assert detections[0].bbox_xyxy == (5.0, 6.0, 11.0, 13.0)

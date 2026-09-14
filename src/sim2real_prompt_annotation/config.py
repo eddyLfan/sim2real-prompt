@@ -18,7 +18,7 @@ DEFAULT_OUTPUT_ROOT = Path(
 )
 MIN_EPISODE_FRAMES = 81
 PROMPT_FRAME_COUNT = 8
-MAX_REFERENCE_IMAGES = 3
+REFERENCE_IMAGE_COUNT = 1
 
 
 class ConfigModel(BaseModel):
@@ -50,7 +50,7 @@ class ProviderConfig(ConfigModel):
     """OpenAI-compatible VLM endpoint configuration."""
 
     name: Literal["qwen_openai"] = "qwen_openai"
-    model: str = "qwen3.7-plus"
+    model: str = "qwen3.5-plus"
     api_key_env: str = "DASHSCOPE_API_KEY"
     base_url: str | None = None
     base_url_env: str = "DASHSCOPE_BASE_URL"
@@ -90,43 +90,94 @@ class PromptConfig(ConfigModel):
 
 
 class ReferenceConfig(ConfigModel):
-    """YOLOE-S Seg inference and deterministic Multi-Reference selection."""
+    """Frame-zero robot removal and full-scene Reference construction."""
 
-    backend: Literal["yoloe"] = "yoloe"
-    model_path: Path = Path("yoloe-11s-seg.pt")
+    # RobotSeg is the authoritative robot-specific segmenter. Its official runtime
+    # is loaded lazily, so metadata-only commands do not need the optional package.
+    backend: Literal["robotseg"] = "robotseg"
+    model_path: Path = Path("robotseg.pt")
+    model_sha256: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
+    robotseg_config: str = "configs/robotseg-infer"
+    robot_category: Literal["robot", "arm", "gripper"] = "robot"
     device: str = "cuda:0"
-    image_size: int = Field(default=640, ge=128, le=4096)
-    batch_size: int = Field(default=32, ge=1, le=512)
-    embedding_cache_size: int = Field(default=64, ge=1, le=4096)
-    # Open-vocabulary task nouns score lower than closed-set COCO labels. 0.15
-    # retains accurate masks on the production smoke corpus while the branch's
-    # mask/area/primary checks still reject unusable crops.
-    confidence: float = Field(default=0.15, ge=0.0, le=1.0)
-    iou_threshold: float = Field(default=0.5, ge=0.0, le=1.0)
-    duplicate_iou: float = Field(default=0.85, ge=0.0, le=1.0)
-    crop_padding: float = Field(default=0.12, ge=0.0, le=0.5)
-    candidate_pool_size: int = Field(default=8, ge=1, le=64)
-    min_images: int = Field(default=1, ge=1, le=MAX_REFERENCE_IMAGES)
-    max_images: int = Field(default=MAX_REFERENCE_IMAGES, ge=1, le=MAX_REFERENCE_IMAGES)
-    selection_seed: int = 42
+    batch_size: int = Field(default=16, ge=1, le=512)
+
+    # A small fixed vocabulary keeps YOLOE text embeddings and detector batches
+    # reusable. YOLOE is never a mask fallback; it is used only for residual robot
+    # quality control after inpainting.
+    robot_queries: tuple[str, ...] = Field(
+        default=("robot", "robot arm", "robot gripper"),
+        min_length=1,
+        max_length=8,
+    )
+    residual_check: bool = True
+    yoloe_model_path: Path = Path("yoloe-11s-seg.pt")
+    yoloe_model_sha256: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
+    yoloe_text_model_path: Path = Path("weights/mobileclip_blt.ts")
+    yoloe_text_model_sha256: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
+    yoloe_image_size: int = Field(default=640, ge=128, le=4096)
+    yoloe_confidence: float = Field(default=0.05, ge=0.0, le=1.0)
+    yoloe_iou_threshold: float = Field(default=0.5, ge=0.0, le=1.0)
+    embedding_cache_size: int = Field(default=16, ge=1, le=4096)
+
+    # Morphology intentionally expands the removal region beyond the predicted
+    # silhouette so robot-colored edge pixels do not survive the composite.
+    mask_close_kernel: int = Field(default=9, ge=1, le=255)
+    mask_dilation_pixels: int = Field(default=12, ge=0, le=512)
+    min_mask_area_fraction: float = Field(default=0.002, gt=0.0, lt=1.0)
+    max_mask_area_fraction: float = Field(default=0.75, gt=0.0, lt=1.0)
+    max_residual_area_fraction: float = Field(default=0.002, ge=0.0, lt=1.0)
+    min_inpaint_change_fraction: float = Field(default=0.01, ge=0.0, le=1.0)
+
+    # The official Big-LaMa layout is a local directory containing config.yaml and
+    # models/best.ckpt. A TorchScript .pt file is also accepted for deployments that
+    # have exported one. Runtime code never downloads models implicitly.
+    inpainting_backend: Literal["big_lama"] = "big_lama"
+    inpainting_model_path: Path = Path("weights/big-lama")
+    inpainting_model_sha256: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
+    inpainting_device: str | None = None
+    inpainting_modulo: int = Field(default=8, ge=1, le=128)
     jpeg_quality: int = Field(default=95, ge=30, le=100)
 
-    @field_validator("device")
+    @field_validator("device", "inpainting_device")
     @classmethod
-    def nonempty_device(cls, value: str) -> str:
+    def nonempty_device(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
         value = value.strip()
         if not value:
             raise ValueError("reference.device must be non-empty")
         return value
 
+    @field_validator("robotseg_config")
+    @classmethod
+    def nonempty_robotseg_config(cls, value: str) -> str:
+        value = value.strip()
+        if not value:
+            raise ValueError("reference.robotseg_config must be non-empty")
+        return value
+
+    @field_validator("robot_queries")
+    @classmethod
+    def normalized_robot_queries(cls, values: tuple[str, ...]) -> tuple[str, ...]:
+        result: list[str] = []
+        seen: set[str] = set()
+        for raw in values:
+            value = " ".join(raw.split()).strip(" ,.;:")
+            key = value.casefold()
+            if value and key not in seen:
+                seen.add(key)
+                result.append(value)
+        if not result:
+            raise ValueError("reference.robot_queries must not be empty")
+        return tuple(result)
+
     @model_validator(mode="after")
-    def valid_reference_counts(self) -> ReferenceConfig:
-        if self.min_images > self.max_images:
-            raise ValueError("reference.min_images cannot exceed max_images")
-        if self.candidate_pool_size < self.max_images:
-            raise ValueError(
-                "reference.candidate_pool_size cannot be smaller than max_images"
-            )
+    def valid_quality_bounds(self) -> ReferenceConfig:
+        if self.mask_close_kernel % 2 == 0:
+            raise ValueError("reference.mask_close_kernel must be odd")
+        if self.min_mask_area_fraction >= self.max_mask_area_fraction:
+            raise ValueError("reference mask area fractions must satisfy min < max")
         return self
 
 
@@ -179,6 +230,9 @@ def _resolve_relative_paths(payload: dict[str, Any], config_path: Path) -> None:
         ("dataset", "split_manifest"),
         ("prompt", "system_prompt"),
         ("reference", "model_path"),
+        ("reference", "yoloe_model_path"),
+        ("reference", "yoloe_text_model_path"),
+        ("reference", "inpainting_model_path"),
         ("output", "root"),
     )
     for section_name, field_name in path_fields:

@@ -76,6 +76,19 @@ def decode_jpeg(payload: bytes) -> np.ndarray:
     return frame
 
 
+def _validate_real_frame_geometry(
+    record: EpisodeRecord,
+    frame: np.ndarray,
+) -> None:
+    actual = frame.shape[:2]
+    expected = (record.real_frame_height, record.real_frame_width)
+    if actual != expected:
+        raise ValueError(
+            f"Real frame zero dimensions {actual[1]}x{actual[0]} differ from "
+            f"metadata {expected[1]}x{expected[0]}: {record.real_video}"
+        )
+
+
 def decode_real_first_frame(
     record: EpisodeRecord,
 ) -> np.ndarray:
@@ -91,6 +104,7 @@ def decode_real_first_frame(
         capture.release()
     if not ok or frame is None or frame.size == 0:
         raise RuntimeError(f"Cannot decode Real frame zero: {record.real_video}")
+    _validate_real_frame_geometry(record, frame)
     return frame
 
 
@@ -102,8 +116,8 @@ def decode_real_video(
 
     The ``VideoCapture`` is opened exactly once and seeks directly to the eight
     selected indices. This avoids decoding thousands of unused intermediate frames.
-    The full-resolution first frame stays as its original BGR array for YOLOE; only
-    the smaller Prompt copy is JPEG-encoded.
+    The full-resolution first frame stays as its original BGR array for robot
+    removal; only the smaller Prompt copy is JPEG-encoded.
     """
 
     if record.real_view == "" or record.real_video == Path():
@@ -144,6 +158,7 @@ def decode_real_video(
                 )
             if frame_index == 0:
                 height, width = frame.shape[:2]
+                _validate_real_frame_geometry(record, frame)
                 first_frame_bgr = frame.copy()
             encoded_frames[frame_index] = RealFrame(
                 frame_index=frame_index,

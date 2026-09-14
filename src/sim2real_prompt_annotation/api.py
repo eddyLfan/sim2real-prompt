@@ -56,7 +56,7 @@ def _config(
 
 
 class Sim2RealPreprocessingPipeline:
-    """The only supported high-level Python API."""
+    """High-level API for independent Prompt and clean-scene Reference branches."""
 
     def __init__(
         self,
@@ -65,6 +65,10 @@ class Sim2RealPreprocessingPipeline:
         dataset_root: str | Path | None = None,
         output_root: str | Path | None = None,
         dataset_glob: str | None = None,
+        reference_device: str | None = None,
+        reference_batch_size: int | None = None,
+        api_concurrency: int | None = None,
+        decode_workers: int | None = None,
         vlm_client: VLMClient | None = None,
         prompt_branch: PromptBranch | None = None,
         reference_branch: ReferenceBranch | None = None,
@@ -81,6 +85,24 @@ class Sim2RealPreprocessingPipeline:
             parsed.output = parsed.output.model_copy(
                 update={"root": Path(output_root).expanduser().resolve()}
             )
+        reference_updates: dict[str, Any] = {}
+        if reference_device is not None:
+            reference_updates["device"] = reference_device
+        if reference_batch_size is not None:
+            reference_updates["batch_size"] = reference_batch_size
+        if reference_updates:
+            reference_payload = parsed.reference.model_dump()
+            reference_payload.update(reference_updates)
+            parsed.reference = type(parsed.reference).model_validate(reference_payload)
+        runtime_updates: dict[str, Any] = {}
+        if api_concurrency is not None:
+            runtime_updates["api_concurrency"] = api_concurrency
+        if decode_workers is not None:
+            runtime_updates["decode_workers"] = decode_workers
+        if runtime_updates:
+            runtime_payload = parsed.runtime.model_dump()
+            runtime_payload.update(runtime_updates)
+            parsed.runtime = type(parsed.runtime).model_validate(runtime_payload)
         self.config = parsed
         self._pipeline = PreprocessingPipeline(
             parsed,
@@ -152,5 +174,5 @@ class Sim2RealPreprocessingPipeline:
         )
 
 
-# One release-cycle compatibility alias; both names use the new two-branch pipeline.
+# One release-cycle compatibility alias; both names use the same two-branch pipeline.
 PromptAnnotationPipeline = Sim2RealPreprocessingPipeline

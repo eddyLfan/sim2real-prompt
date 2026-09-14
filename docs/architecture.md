@@ -1,208 +1,242 @@
 # 架构与文件职责
 
-## 设计边界
+## 1. 固定边界
 
-这条 pipeline 的目标是把一个已具备稳定身份和 split 的 paired LeRobot episode
-转换为 Transfer 训练所需的自然语言 prompt 与 1～3 张 Multi-Reference 图片。运行时
-只读取配置的 Real 主视角，默认 `camera_head`。任务语义来自数据集元数据，视频帧只
-补充可见执行方式、场景和光照。
+该 pipeline 把已具备稳定身份和 domain split 的 paired LeRobot episode 转换为
+Transfer 训练所需的自然语言 Prompt 与一张干净环境 Reference。两条分支都只消费配置的
+Real 主视角，默认 `camera_head`：
 
-每个 episode 的主路径固定为：
+```text
+                         ┌─ uniform 8 frames + task metadata
+Real main-view video ────┤        └─ API VLM ──> prompt-only
+                         │
+                         └─ full-resolution frame 0
+                                  └─ RobotSeg whole-robot mask
+                                       └─ morphology + Big-LaMa
+                                            └─ YOLOE residual QA
+                                                 └─ one full scene Reference
+```
 
-1. `dataset.py` 只读发现并验证身份、split、任务和 Real 视频路径，不扫描 Parquet。
-2. `pipeline.py` 分别计算 Prompt 和 Reference cache key。
-3. Prompt 未缓存时，`video.py` 只打开一次 Real 视频，直接 seek 并取得恰好 8 个均匀
-   帧，同时把原始 BGR 首帧供 Reference 共用。
-4. `prompt_branch.py` 把原始任务、机器人/子任务元数据和 8 帧交给 `qwen.py`。每个
-   episode 只发一次结构化 VLM 请求，响应同时包含一句 prompt 和 1～8 个
-   `reference_queries`。
-5. Reference 未缓存时，`yoloe.py` 只在 Real 首帧执行 YOLOE-11s-seg；相同 query
-   signature 的 episode 合并成 GPU batch，并复用文本 embedding。
-6. `reference_branch.py` 依据 segmentation mask 做面积/置信度/重叠质检，生成带上下文
-   padding 的候选 crop，再用 `selection_seed + sample_id` 选择 1～3 张。
-7. `validation.py` 检查 prompt、required query 覆盖、primary Reference 与数量；
-   `export.py` 保存独立 checkpoint，并原子发布图片和两个 manifest。
-8. `audit.py` 重新读取最终训练产物，验证关联、顺序、路径和图片哈希。
+Prompt 用一句自然英文描述机器人本体、任务、场景和可见光照。Reference 保留 frame 0
+的完整环境、任务物体和背景，只移除机器人。Reference 不读取 Prompt、VLM query 或本地任务
+分词，不做物体 crop，也不选择其他帧。
 
-不包含备用定位链路。YOLOE 没有返回可用 mask，required 实体不在候选池，或最终选择
-中没有 primary 任务物体时，当前 episode 失败并进入报告。
+## 2. 每个 episode 的执行顺序
 
-## Prompt 分支契约
+1. `dataset.py` 只读发现并验证 `source_id`、domain/split、任务和唯一 Real 视频路径。
+2. `pipeline.py` 分别计算 Prompt 与 Reference cache key；两者互不包含对方的结果。
+3. Prompt miss 时，`video.py` 一次打开视频并 seek 到 8 个均匀位置。第一个位置固定为
+   frame 0，原始 BGR frame 0 可直接供 Reference 分支复用。
+4. 只有 Reference miss 而 Prompt hit 时，`video.py` 只解码原分辨率 frame 0。
+5. `prompt_branch.py` 把任务/机器人补充元数据和 8 张压缩 JPEG 发给 `qwen.py`，每条
+   episode 只请求一个 prompt JSON 字段。
+6. `reference_branch.py` 合并 RobotSeg 返回的 whole-robot mask，执行 closing、dilation 和
+   面积门禁，再让 `inpainting.py` 填补 mask 区域。
+7. 可选但生产默认开启的 YOLOE residual QA 只检查 inpaint 结果是否还含机器人；它不是
+   RobotSeg 的 mask fallback。
+8. `validation.py` 分别校验两个分支。`export.py` 保存独立 checkpoint；只有两个成功结果
+   都存在时才构造单元素关联并原子发布。
+9. `audit.py` 不加载模型或源视频，重新验证最终 manifest、Reference JPEG 与跨表关联。
+
+当两个分支同时 miss 时，它们可在独立 executor 中交错执行；API 等待不会串行阻塞 GPU
+Reference 路径。外层依然按 `reference.batch_size` 分块，以限制内存中的原分辨率 frame 0
+数量。
+
+## 3. Prompt 分支
 
 输入固定为：
 
 - `meta/episodes.jsonl:tasks[0]`；
-- `meta/info.json:robot_type`、可选 `labels/labels.json:subtasks` 与可选
+- `meta/info.json:robot_type`、可选 `labels/labels.json:subtasks` 和可选
   `dataset.metadata_manifest` 补充字段；
-- 配置的 Real 视角中包含首帧和尾帧的 8 个均匀帧。
+- Real 主视角中包含首尾的 8 个唯一、递增、均匀帧。
 
-8 帧会缩小到 `prompt.resize_long_edge`，不会放大。Qwen OpenAI-compatible endpoint
-返回符合 `PromptPayload` 的单个 JSON object，例如：
+图片只缩小到 `prompt.resize_long_edge`，不放大。OpenAI-compatible endpoint 返回精确
+`PromptPayload`：
 
 ```json
 {
-  "prompt": "The Agilex robot aligns the handles of a preassembled banana bunch in the same direction on a worktable under even indoor lighting.",
-  "reference_queries": [
-    {"query": "banana", "role": "primary", "required": true},
-    {"query": "Agilex robot", "role": "robot", "required": false},
-    {"query": "worktable", "role": "workspace", "required": false}
-  ]
+  "prompt": "The Agilex robot hangs scissors on a rack in a well-lit workshop."
 }
 ```
 
-角色集合是
-`primary | destination | secondary | robot | workspace | environment | background`。
-每个 primary 必须 `required=true`；依赖目标实体才能完成任务时，destination 也应
-required。任务实体必须来自权威任务描述，但 query 应去除装配状态、关系和动作修饰，
-保留 YOLOE 容易匹配的最短可见名词（例如把 `preassembled banana bunch` 化为
-`banana`）。可选的机器人、工作区、环境和背景 query 必须在第 1 张输入图（Real frame 0）中清晰、可分割，不能把后续帧才出现的偶然物体
-提升为任务实体。光照只写入 prompt，不作为检测 query。
+输出必须是一句自然英文视频描述，最多 56 词、560 字符，包含任务主体、动作和可见环境
+信息，不暴露抽帧、标注或 Sim/Real 数据机制。VLM 不再生成任何 Reference 查询；旧 Prompt
+checkpoint 中遗留的多余字段只在核心输入 fingerprint 兼容时被丢弃迁移，不会流入正式产物。
 
-最终 prompt 必须是一句自然英文视频描述，最多 56 词、560 字符，并且不能暴露数据
-预处理机制。
+Prompt cache identity 覆盖 sample ID、任务和补充元数据、episode 长度/fps、Real 视频
+路径/size/mtime、8 帧采样/编码设置、system prompt 字节、API 模型与 endpoint、生成参数和
+分支 schema。命中时不解码 8 帧且不调用 API。
 
-## Reference 分支契约
+## 4. Reference 分支
 
-YOLOE-11s-seg 输出的 mask 会映射回首帧原始尺寸。mask 的紧致边界是
-`bbox_xyxy`，按 `reference.crop_padding` 扩展并裁剪到图片边界后得到 `crop_xyxy`。
-候选依次经过：
+### 4.1 Whole-robot mask
 
-- 配置置信度阈值；
-- mask 必须存在且非空；
-- 默认分割面积占比 `[0.0005, 0.85]`；
-- bbox IoU 去重；
-- JPEG 字节去重；
-- `candidate_pool_size` 上限。
+`RobotSegSegmenter` 懒加载官方 `showlab/RobotSeg` predictor，并对 frame 0 使用自动
+whole-robot 类别；不要求人工 point/box。返回 mask 必须映射到原图尺寸。多个有效预测先做
+union，然后经过：
 
-候选池可以大于 3，但只存在 Reference checkpoint 中。最终目标数量在
-`[min_images, min(max_images, candidate_count)]` 内 seeded 随机产生；primary 和 required
-候选优先占用槽位，其余候选随机 dropout。相同 `selection_seed`、`sample_id` 和输入会
-得到完全相同的结果，便于续跑与复现；修改 seed 会使 Reference cache 失效并重新选择。
-这是预处理时的静态采样，不是训练过程中逐 epoch 变化的 dropout。
+1. 二值化；
+2. 奇数核 closing，闭合机械臂/夹爪内部小裂缝；
+3. `mask_dilation_pixels` 扩张，去除机器人轮廓边缘；
+4. `min_mask_area_fraction <= area <= max_mask_area_fraction` 门禁。
 
-所有 selected crop 固定来自 Real frame 0，路径固定为：
+最终 mask 的 SHA-256 按 full-resolution `uint8` 二值像素字节计算；同一个 mask 还以 PNG
+保存在 Reference checkpoint，供人工检查和续跑完整性验证。
+
+### 4.2 Big-LaMa inpainting
+
+`BigLamaInpainter` 接收原始 BGR frame 0 与 final mask，内部转成 RGB `[0,1]` tensor，并按
+`inpainting_modulo` 只向右/下 pad。生产支持：
+
+- 官方 Big-LaMa 目录：`config.yaml` 与 `models/best.ckpt`；
+- 已由部署方验证、接口兼容的 TorchScript 文件。
+
+输出裁回原始宽高，再编码为一张 full-frame JPEG。mask 内发生变化的像素比例必须达到
+`min_inpaint_change_fraction`；否则视为没有真实执行去除并失败。
+
+### 4.3 Residual-robot QA
+
+生产默认 `residual_check: true`。YOLOE 用固定小词表 `robot/robot arm/robot gripper`
+检查 inpaint 后整图，合并所有残留 mask 后计算面积比例。超过
+`max_residual_area_fraction` 则拒绝发布。YOLOE 不影响 removal mask，也不能在 RobotSeg
+漏检时替代分割。
+
+Reference cache identity 覆盖 sample ID、frame-0 Real 视频路径/size/mtime/ctime/device/inode、
+声明的图像尺寸、视角、RobotSeg
+runtime/config/checkpoint identity、morphology 和质量阈值、Big-LaMa runtime/checkpoint、
+YOLOE runtime/checkpoint/固定词表以及 JPEG 设置。Prompt 模型、任务描述和 Prompt cache 均不
+参与。命中成功 checkpoint 时不解码 frame 0、不调用三个模型；命中确定性失败 checkpoint 时
+同样不重复昂贵推理。
+
+## 5. Fail-closed 规则
+
+以下情况都使当前 Reference 分支失败：
+
+- RobotSeg runtime/checkpoint 不可用或没有非空 whole-robot mask；
+- mask 几何、面积或哈希不满足配置；
+- Big-LaMa runtime/checkpoint 不可用、输出 shape/数值错误或 mask 内变化不足；
+- residual QA runtime 不可用，或残留机器人面积超过门限；
+- JPEG、mask PNG、checkpoint 或发布文件无法完成一致性验证。
+
+失败时不允许发布源 frame 0、裁图、纯色/OpenCV 填充、YOLOE mask 或任何其他备用产物。
+确定性失败写入 `reference_failures/` 并绑定相同 cache key；模型初始化、CUDA/OOM 等运行时
+错误仍明确进入 `run_report.json`，不会伪装为确定性视觉结论。
+
+`runtime.fail_fast=false` 时其他 episode 继续；命令最终以 `partial` 和非零退出码报告失败。
+
+## 6. Checkpoint、并发与发布
+
+两套独立 checkpoint 位于：
 
 ```text
-Reference/episode_<episode_index:06d>/reference_<ordinal:02d>.jpg
+output.root/
+  prompt/<prefix>/<sha256(sample_id)>.json
+  reference/<prefix>/<sha256(sample_id)>.json
+  reference_failures/<prefix>/<sha256(sample_id)>.json
+  reference_images/<prefix>/<sha256(sample_id)>/<reference-cache-key>/
+    reference_00.jpg
+    removal_mask.png
 ```
 
-图片内容 SHA-256 同时构成 `reference_id`；最终顺序先按 primary/required/role 优先级
-稳定排列。每个最终 episode 至少有一个 primary Reference。
+`runtime.resume=true` 且没有 `--force` 时，只运行 miss 的分支。`--force` 同时忽略两套
+checkpoint。cache JSON 损坏、schema/key 不匹配、staging JPEG 或 mask PNG 哈希不一致均按
+miss/failure 处理，不盲信文件存在。
 
-## 批处理和缓存
+父仓并行入口先全局 discovery，再按 source 稳定分片到固定 GPU worker。每个 worker 生命周期
+内复用 RobotSeg、Big-LaMa 和 YOLOE；`runtime.decode_workers` 与
+`runtime.api_concurrency` 分别约束视频解码和 API 并发。全局身份/domain/split 不变量在分片
+前验证，per-worker report 最后聚合。
 
-外层按 `reference.batch_size` 分块，避免一次将整个数据集的视频帧留在内存中。
-Real 视频解码使用 `runtime.decode_workers` 线程池，VLM 使用
-`runtime.api_concurrency` 独立线程池。YOLOE 请求按完整 query signature 分组；每组只
-激活一次词表并做一次 batch prediction。
+最终发布使用临时文件替换、dataset-level `flock` 与 transaction marker。子集运行只 merge
+本次成功 episode，保留其他行。一次 episode 的 Prompt 和 Reference 必须同时有效才更新两个
+manifest。迁移到 exact-one 时发布器固定写 `reference_00.jpg`，并清理同 episode 目录中过时的
+其他 ordinal JPEG，避免旧数据被误消费。
 
-`output.root/prompt/<prefix>/<sha256(sample_id)>.json` 和
-`output.root/reference/<prefix>/<sha256(sample_id)>.json` 是两套分片 checkpoint；最终
-crop 先按 sample/cache key 写入 `output.root/reference_images/` staging，再进入发布事务：
+## 7. 最终 schema v3
 
-| 分支 | cache key 的核心输入 | 命中后的行为 |
-| --- | --- | --- |
-| Prompt | sample ID、任务/机器人/补充元数据、episode length/fps、Real 视频路径/size/mtime、8 帧配置、system prompt、模型与 endpoint、生成参数 | 不解码 8 帧、不调用 VLM |
-| Reference | Prompt queries、Real 视频路径/size/mtime、YOLOE 参数、权重 SHA-256、Ultralytics 版本、选择 seed | 不解码首帧、不调用 YOLOE |
+数据集内只有三个训练产物：
 
-当 Prompt 命中而 Reference 未命中，pipeline 只打开并解码 Real 首帧。Prompt 未命中时，
-同一次 8 帧定点解码已经保留首帧，不会为了 Reference 再开视频。cache JSON 损坏、key
-不匹配或已发布图片哈希不匹配都按 miss 处理。
-
-`runtime.resume=true` 且没有 `--force` 时启用上述行为。`--force` 同时忽略两分支已有
-checkpoint。VLM 的可重试错误按 runtime 的次数和指数退避处理；YOLOE batch 只有发生
-显存/内存分配错误时才递归二分降载，确定性配置或解析错误会让该组一次失败，避免指数级
-重复推理；后处理错误按 episode 隔离。
-`fail_fast=false` 会继续
-其他 episode，并把 `sample_id`、阶段、异常类型和信息写进 `run_report.json`。
-
-发布使用临时文件替换、dataset-level `flock` 和 transaction marker，避免并发进程写出
-半行 manifest，并使中断发布能被 audit 和 Transfer reader 明确识别。中断后的下一次运行
-必须覆盖 marker 中的全部 sample 才能恢复，不能用无关子集掩盖半完成代次。发布始终只更新
-本次成功 episode、保留其他 row；一次 `run` 只把 Prompt 和 Reference 都通过校验的 episode
-加入发布集合。
-
-## 最终训练契约
-
-数据集内的训练产物只有：
-
-- `Reference/episode_XXXXXX/reference_YY.jpg`；
+- `Reference/episode_XXXXXX/reference_00.jpg`；
 - `meta/episodes_prompt.jsonl`；
 - `meta/reference_images.jsonl`。
 
-Prompt row 的 schema 是精确的
-`{episode_index, prompt, reference_ids}`。Reference row 是
-`{schema_version: 2, episode_index, references}`；每个 reference 包含图片身份/路径、
-首帧与视角、query/label/role/scope、YOLOE confidence、mask bbox、实际 crop 边界以及
-图片 SHA-256。两个 row 按 episode join，Prompt 的 `reference_ids` 必须与 Reference
-数组中的 ID 数量、内容和顺序完全相同。
+Prompt row 是 `{episode_index, prompt, reference_ids}`，其中 `reference_ids` 恰有一个
+SHA-prefixed ID。Reference row 是 `{schema_version: 3, episode_index, references}`，其中
+`references` 恰有一项，字段包括：
 
-`audit` 只使用发现阶段元数据和上述最终产物，不加载 API client、YOLOE、源视频内容或
-Parquet。它验证：每条 episode 都有两个 row，manifest key 与源 episode 集合精确一致，
-1～3 张图均存在且可解码，图片尺寸与 crop 边界一致，路径严格符合 ordinal，哈希与 ID
-一致，视角/帧号正确，至少一个 primary，且跨表顺序一致。显式传入 episode/limit 时只保留
-并审计选中 row，不让未选 episode 的损坏产物影响局部重跑，并将 `annotations_ready` 留空；
-默认全量 audit 才能确认 annotation 产物完整。视频、Parquet、关节映射及训练配置仍由
-Transfer 自身的 validator 检查。
+```text
+reference_id             = "sha256:" + final JPEG SHA-256
+reference_path           = Reference/episode_XXXXXX/reference_00.jpg
+source_view              = configured Real main view
+source_frame_index       = 0
+scope                    = environment
+reference_kind           = robot_removed_scene
+width, height            = source frame-0 dimensions
+source_frame_sha256      = decoded source frame identity
+mask_sha256              = final full-resolution binary mask pixel identity
+mask_area_fraction       = final removal mask fraction
+sha256                   = final JPEG SHA-256
+provenance               = segmenter/inpainter/residual-QA identities and gates
+```
 
-## 身份与 split 不变量
+两个 row 按 episode join，Prompt 的单元素 `reference_ids` 必须精确等于 Reference ID。
+旧版 schema、零项/多项 Reference、非 frame-0、非 environment、非 robot-removed scene、尺寸或
+内容哈希不一致都会被拒绝。
 
-`source_id` 是源版本身份，不是易变的显示名。canonical sample ID 使用长度前缀编码：
+`audit` 只读取发现阶段 metadata 与最终产物，不加载 API client、RobotSeg、Big-LaMa、YOLOE、
+源视频或 Parquet。全量 audit 还要求 manifest episode 集合与源 episode 集合精确相等；局部
+selection audit 只验证所选行，`annotations_ready` 保持未定。视频、Parquet、关节映射和 Transfer
+训练配置由父仓 validator 检查。
+
+## 8. 身份与 split
+
+`source_id` 是版本化源身份，不是目录显示名。canonical sample ID 使用长度前缀：
 
 ```text
 <len(source_id)>:<source_id>:<episode_index>
 ```
 
-这避免空格、下划线、路径分隔符等字符被替换后发生碰撞；checkpoint 文件名再对完整 ID
-做 SHA-256，因此不会产生路径穿越或文件名过长。正式修改任务、视频或其他决定样本语义
-的源内容后，应给数据分配新的 `source_id`。
+checkpoint 文件名对完整 ID 求 SHA-256，避免字符替换碰撞和路径问题。正式修改任务、视频或
+其他决定样本语义的源内容后，必须发布新的 `source_id`。
 
-`domain` 是 split 隔离单位。一个 domain 不允许在当前数据集内、或同次发现的多个数据集
-间跨越 train/validation。episode row、`info.splits` 和外部 domain assignment 之间的任何
-冲突都立即失败，不做 episode 级随机拆分。
+`domain` 是 split 隔离单位。一个 domain 不能在当前 source 或同次发现的多个 source 间跨越
+train/validation。episode row、`info.splits` 和外部 assignment 冲突时立即失败，不做随机重划。
 
-## 文件职责
-
-以下是重构后仍属于运行路径的文件；各模块只承担一层职责。
+## 9. 文件职责
 
 | 文件 | 唯一职责 |
 | --- | --- |
-| `README.md` | 安装、数据要求、测试数据正式命令、CLI 和输出契约入口。 |
-| `config.example.yaml` | 严格配置 schema 的可运行示例；相对路径以 YAML 所在目录为基准。 |
-| `.env.example` | API 环境变量名称示例，不含真实密钥。 |
-| `pyproject.toml` | Python 包元数据、基础/YOLOE/dev 依赖、CLI entry point、测试与 lint 设置。 |
-| `LICENSE` | 本仓库自有代码的 Apache-2.0 许可。 |
-| `THIRD_PARTY_NOTICES.md` | Ultralytics/YOLOE 的 AGPL-3.0 与权重许可边界。 |
-| `.gitignore` | 排除密钥、本地输出、模型权重和构建缓存。 |
-| `.github/workflows/ci.yml` | 运行 pytest、Ruff、构建 wheel，并验证安装后的 CLI。 |
-| `examples/python_api.py` | 唯一高层 Python facade 的最小示例。 |
-| `docs/architecture.md` | 本文：分支、并发、缓存、失败和逐文件边界。 |
-| `src/sim2real_prompt_annotation/__init__.py` | 导出高层 facade 与配置类型。 |
-| `src/sim2real_prompt_annotation/__main__.py` | 支持 `python -m sim2real_prompt_annotation`，转交 CLI。 |
-| `src/sim2real_prompt_annotation/api.py` | `inspect/run/audit` 的 Python facade、配置 override 与 episode selector 解析。 |
-| `src/sim2real_prompt_annotation/cli.py` | 仅定义 `inspect`、`run`、`audit` 三个子命令及 JSON/退出码行为。 |
-| `src/sim2real_prompt_annotation/config.py` | Pydantic 严格配置、默认值、交叉字段约束和相对路径解析。 |
-| `src/sim2real_prompt_annotation/models.py` | 分支 DTO、VLM schema、检测/图片对象及最终 manifest row 类型。 |
-| `src/sim2real_prompt_annotation/dataset.py` | 严格只读 metadata discovery、canonical ID、任务/视角路径和 domain split 校验。 |
-| `src/sim2real_prompt_annotation/video.py` | 单次打开并定点读取 Real 8 帧、原始首帧共享和 Prompt JPEG 编码。 |
-| `src/sim2real_prompt_annotation/qwen.py` | OpenAI-compatible Qwen transport、8 张图片打包、JSON schema 请求和响应解析。 |
-| `src/sim2real_prompt_annotation/prompt_branch.py` | 组装一次 VLM 请求并产出 prompt、queries 与输入 fingerprint。 |
-| `src/sim2real_prompt_annotation/yoloe.py` | YOLOE 懒加载、query normalization/embedding cache、signature 分组和 mask 几何解析。 |
-| `src/sim2real_prompt_annotation/reference_branch.py` | 首帧检测后处理、候选池、seeded 1～3 选择和 JPEG crop 构造。 |
-| `src/sim2real_prompt_annotation/validation.py` | 无 I/O 的 Prompt/Reference 产品不变量检查。 |
-| `src/sim2real_prompt_annotation/io_utils.py` | 路径 containment、哈希、JSON(L) 与原子写基础函数。 |
-| `src/sim2real_prompt_annotation/export.py` | 两分支 checkpoint、Reference 图片保存、manifest merge、锁和发布。 |
-| `src/sim2real_prompt_annotation/audit.py` | 不调用模型的最终 manifest/图片结构与哈希审计。 |
-| `src/sim2real_prompt_annotation/pipeline.py` | 分块、并发、retry/cache 调度、成功 join、发布和 run report。 |
-| `src/sim2real_prompt_annotation/prompts/prompt_system.txt` | VLM 的单句 caption 与任务实体 query 规则。 |
-| `src/sim2real_prompt_annotation/py.typed` | 声明该发行包提供类型信息。 |
-| `tests/unit/test_config.py` | 配置常量、严格校验和路径解析测试。 |
-| `tests/unit/test_dataset.py` | 身份、split、视角和只读 discovery 测试。 |
-| `tests/unit/test_video.py` | 均匀索引、单次打开与定点解码测试。 |
-| `tests/unit/test_prompt_branch.py` | 单请求、8 帧顺序和结构化 Prompt 输出测试。 |
-| `tests/unit/test_yoloe.py` | YOLOE 懒加载、有界 embedding cache、batch 和原图 mask 几何测试。 |
-| `tests/unit/test_reference_branch.py` | mask 过滤、去重、seeded 选择与无 fallback 测试。 |
-| `tests/test_pipeline_integration.py` | CPU fake 下验证双分支、发布、审计、失败和零解码续跑。 |
+| `README.md` | 安装、模型准备、数据要求、正式命令、CLI 与输出入口。 |
+| `config.example.yaml` | 严格配置的完整示例；相对路径以 YAML 所在目录为基准。 |
+| `pyproject.toml` | 包元数据、基础/Reference/dev 依赖、CLI、pytest 与 Ruff 设置。 |
+| `THIRD_PARTY_NOTICES.md` | RobotSeg、LaMa、Ultralytics/YOLOE 的许可边界。 |
+| `examples/python_api.py` | 高层 Python facade 的最小示例。 |
+| `docs/architecture.md` | 本文：数据流、缓存、失败、schema 与逐文件边界。 |
+| `src/sim2real_prompt_annotation/__init__.py` | 导出高层 facade 与配置接口。 |
+| `src/sim2real_prompt_annotation/__main__.py` | `python -m` 到 CLI 的入口。 |
+| `src/sim2real_prompt_annotation/api.py` | `inspect/run/audit` facade、配置 override 与 selector。 |
+| `src/sim2real_prompt_annotation/cli.py` | 三个子命令、JSON 输出和退出码。 |
+| `src/sim2real_prompt_annotation/config.py` | Pydantic 配置、交叉约束与路径解析。 |
+| `src/sim2real_prompt_annotation/models.py` | Prompt、mask、scene artifact、checkpoint 与 manifest DTO。 |
+| `src/sim2real_prompt_annotation/dataset.py` | 只读 discovery、canonical ID、Real view 和 split 校验。 |
+| `src/sim2real_prompt_annotation/video.py` | 均匀 8 帧和独立 frame-0 定点解码、Prompt JPEG。 |
+| `src/sim2real_prompt_annotation/qwen.py` | OpenAI-compatible transport 与 prompt-only JSON 解析。 |
+| `src/sim2real_prompt_annotation/prompt_branch.py` | VLM 请求组装、Prompt 校验与分支 fingerprint。 |
+| `src/sim2real_prompt_annotation/robot_mask.py` | Segmenter protocol、BGR/mask geometry 公共工具。 |
+| `src/sim2real_prompt_annotation/robotseg.py` | 官方 RobotSeg 的懒加载、checkpoint 校验和 frame-0 adapter。 |
+| `src/sim2real_prompt_annotation/inpainting.py` | Big-LaMa 懒加载、tensor/padding 适配和 batch inpainting。 |
+| `src/sim2real_prompt_annotation/yoloe.py` | YOLOE 懒加载与固定词表 residual-mask QA。 |
+| `src/sim2real_prompt_annotation/reference_branch.py` | mask union/morphology、inpaint 门禁、residual QA 和 JPEG 构造。 |
+| `src/sim2real_prompt_annotation/validation.py` | 无 I/O 的 Prompt/scene Reference 不变量验证。 |
+| `src/sim2real_prompt_annotation/io_utils.py` | containment、哈希、JSON(L) 和原子写基础函数。 |
+| `src/sim2real_prompt_annotation/export.py` | 独立 checkpoint、staging mask/JPEG、manifest merge 与事务发布。 |
+| `src/sim2real_prompt_annotation/audit.py` | 无模型的 schema v3/JPEG/关联审计。 |
+| `src/sim2real_prompt_annotation/pipeline.py` | 分块、并发、retry/cache、success join、发布和报告。 |
+| `src/sim2real_prompt_annotation/prompts/prompt_system.txt` | 一句视频 caption 的 VLM 规则。 |
+| `tests/unit/` | DTO、配置、解码、VLM、RobotSeg/Big-LaMa/YOLOE 和分支单元测试。 |
+| `tests/test_pipeline_integration.py` | CPU fake 下的双分支、schema v3、失败和续跑集成测试。 |
 
-测试通过依赖注入 fake VLM/YOLOE 保持 CPU-only；真实运行仍需要 endpoint、YOLOE 可选
-依赖、分割权重和配置指定的设备。
+CPU 单测通过 dependency injection，不代表真实权重质量已经验收。生产放行必须在目标 GPU 上
+检查源 frame 0、最终 removal mask、inpaint 后场景、YOLOE 残留率、schema v3 audit 和第二次
+运行的双分支 cache hit。

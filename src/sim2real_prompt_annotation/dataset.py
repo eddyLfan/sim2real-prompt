@@ -62,7 +62,11 @@ def _view_name(video_key: str) -> str:
     return video_key.rsplit(".", 1)[-1]
 
 
-def _real_video_key(info_path: Path, info: dict[str, Any], view: str) -> str:
+def _real_video_key(
+    info_path: Path,
+    info: dict[str, Any],
+    view: str,
+) -> tuple[str, int, int]:
     features = info.get("features")
     if not isinstance(features, dict):
         raise ValueError(f"{info_path}: features must be an object")
@@ -81,6 +85,21 @@ def _real_video_key(info_path: Path, info: dict[str, Any], view: str) -> str:
             f"{info_path}: Real view {view!r} is ambiguous across {sorted(matches)}"
         )
     real_key = matches[0]
+    real_spec = features[real_key]
+    shape = real_spec.get("shape")
+    if (
+        not isinstance(shape, (list, tuple))
+        or len(shape) != 3
+        or any(isinstance(value, bool) or not isinstance(value, int) for value in shape)
+        or shape[0] < 1
+        or shape[1] < 1
+        or shape[2] != 3
+    ):
+        raise ValueError(
+            f"{info_path}: configured Real view {real_key!r} shape must be "
+            "[height, width, 3] with positive integer dimensions"
+        )
+    real_height, real_width, _ = shape
     sim_key = f"{real_key}_sim"
     sim_spec = features.get(sim_key)
     if not isinstance(sim_spec, dict) or sim_spec.get("dtype") != "video":
@@ -88,7 +107,7 @@ def _real_video_key(info_path: Path, info: dict[str, Any], view: str) -> str:
             f"{info_path}: paired Sim view {sim_key!r} is unavailable; "
             "the pipeline reads only Real pixels but requires paired metadata"
         )
-    return real_key
+    return real_key, real_height, real_width
 
 
 def _video_path(
@@ -312,6 +331,8 @@ class _DatasetSource:
     source_id: str
     domain: str
     real_video_key: str
+    real_frame_height: int
+    real_frame_width: int
     episodes: list[dict[str, Any]]
 
 
@@ -333,7 +354,9 @@ def _resolve_sources(
                 f"source_id {source_id!r} is shared by {previous_root} and {root}"
             )
         source_roots[source_id] = root
-        real_video_key = _real_video_key(info_path, info, config.real_view)
+        real_video_key, real_frame_height, real_frame_width = _real_video_key(
+            info_path, info, config.real_view
+        )
         episode_path = root / "meta/episodes.jsonl"
         episodes = read_jsonl(episode_path)
         if not episodes:
@@ -388,6 +411,8 @@ def _resolve_sources(
                 source_id=source_id,
                 domain=domain,
                 real_video_key=real_video_key,
+                real_frame_height=real_frame_height,
+                real_frame_width=real_frame_width,
                 episodes=episodes,
             )
         )
@@ -479,6 +504,8 @@ def discover_episodes(
                     task=task,
                     subtasks=subtasks.get(episode_index, ()),
                     real_view=config.real_view,
+                    real_frame_height=source.real_frame_height,
+                    real_frame_width=source.real_frame_width,
                     real_video=_video_path(
                         source.root,
                         video_template,

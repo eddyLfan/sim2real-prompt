@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "sim2real-prompt-annotation"
-version = "0.2.0"
-description = "Real-video Prompt and Multi-Reference preprocessing for paired Sim/Real LeRobot data"
+version = "0.3.0"
+description = "Real-video prompt and robot-removed scene Reference preprocessing for paired Sim/Real LeRobot data"
 readme = "README.md"
 requires-python = ">=3.10"
 license = {file = "LICENSE"}
@@ -30,6 +30,7 @@ dependencies = [
 
 [project.optional-dependencies]
 reference = [
+  "omegaconf>=2.3,<3",
   "ultralytics>=8.4,<9",
 ]
 dev = [
